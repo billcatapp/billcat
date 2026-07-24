@@ -252,6 +252,11 @@ class _BillingScreenState extends State<BillingScreen> {
   String _paperSize = 'A4';
   bool _autoPrint = false;
 
+  // Print bill dialog last-used settings
+  String _lastPrintDocType = 'Invoice';
+  bool _lastPrintToPrinter = false;
+  bool _lastPrintWhatsApp = false;
+
   // Current queued invoice number
   String _queuedInvoiceNo = '';
   String _queuedTransactionId = '';
@@ -422,6 +427,10 @@ class _BillingScreenState extends State<BillingScreen> {
           ?.userMetadata?['logo_url'] as String? ?? '';
       _logoUrl = (s['logo_url']?.isNotEmpty == true ? s['logo_url']! : metaLogoUrl);
       _autoPrint = (s['auto_print'] ?? '0') == '1';
+      final savedPrintDocType = s['print_doc_type'] ?? _lastPrintDocType;
+      _lastPrintDocType = savedPrintDocType == 'Quotation' ? 'Quotation' : 'Invoice';
+      _lastPrintToPrinter = (s['print_to_printer'] ?? '0') == '1';
+      _lastPrintWhatsApp = (s['print_via_whatsapp'] ?? '0') == '1';
       _storeUpiId = s['store_upi_id'] ?? _storeUpiId;
       _branchNumber = s['branch_number'] ?? _branchNumber;
       _ownerPasscode    = s['owner_passcode'] ?? '';
@@ -5450,9 +5459,9 @@ class _BillingScreenState extends State<BillingScreen> {
       _printRecord(_snapshotCart(cart), docType: docType, toPrinter: toPrinter);
 
   void _showPrintBillDialog(CartProvider cart) {
-    bool sendToPrinter = false;
-    bool sendWhatsApp = false;
-    String docType = 'Invoice';
+    bool sendToPrinter = _lastPrintToPrinter;
+    bool sendWhatsApp = _lastPrintWhatsApp;
+    String docType = _lastPrintDocType;
     final phoneCtrl = TextEditingController(text: cart.customerPhone);
 
     showDialog(
@@ -5619,6 +5628,15 @@ class _BillingScreenState extends State<BillingScreen> {
                     onPressed: () {
                       final txId = _queuedTransactionId.isNotEmpty ? _queuedTransactionId : Uuid().v4();
                       final snapshot = _snapshotCart(cart, transactionId: txId);
+                      // Remember the choices so the dialog reopens the same way
+                      _lastPrintDocType = docType;
+                      _lastPrintToPrinter = sendToPrinter;
+                      _lastPrintWhatsApp = sendWhatsApp;
+                      LocalDbService.saveSettings({
+                        'print_doc_type': docType,
+                        'print_to_printer': sendToPrinter ? '1' : '0',
+                        'print_via_whatsapp': sendWhatsApp ? '1' : '0',
+                      });
                       Navigator.pop(ctx);
                       if (sendToPrinter) _printCurrentBill(cart, docType: docType, toPrinter: true);
                       if (sendWhatsApp) {
