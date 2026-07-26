@@ -7,8 +7,16 @@ SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:?Set SUPABASE_SERVICE_KEY in your e
 BUCKET="billcat-updates"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"  # set via: export GITHUB_TOKEN=ghp_...
 GITHUB_REPO="billcatapp/billcat"
-APP_DIR="/Users/fouzehh/Documents/BillCat/app"
-RELEASES_DIR="/Users/fouzehh/Documents/BillCat/releases"
+
+# Paths are derived from this script's location so the release builds from
+# whichever checkout it lives in (this one is ~/billcat).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+APP_DIR="$REPO_ROOT/app"
+RELEASES_DIR="$REPO_ROOT/releases"
+
+# Ensure flutter is on PATH (this machine keeps it under ~/development/flutter).
+command -v flutter >/dev/null 2>&1 || export PATH="$HOME/development/flutter/bin:$PATH"
 
 # ── Version: auto-increment patch, or pass as arg ────────────────────────────
 CURRENT_VERSION=$(grep "^version:" "$APP_DIR/pubspec.yaml" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
