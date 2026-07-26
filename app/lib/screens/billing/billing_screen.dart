@@ -18,6 +18,7 @@ import '../../models/product.dart';
 import '../../models/transaction_record.dart';
 import '../../providers/cart_provider.dart';
 import '../../services/connectivity_service.dart';
+import '../../services/escpos_receipt.dart';
 import '../../services/label_printer_service.dart';
 import '../../services/local_db_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -251,11 +252,35 @@ class _BillingScreenState extends State<BillingScreen> {
   Printer? _activePrinter;
   String _paperSize = 'A4';
   bool _autoPrint = false;
+  // Thermal (ESC/POS) options — printers without a cutter set this false.
+  bool _thermalAutoCut = true;
 
   // Print bill dialog last-used settings
   String _lastPrintDocType = 'Invoice';
   bool _lastPrintToPrinter = false;
   bool _lastPrintWhatsApp = false;
+
+  // Focuses the VARIANT box so a freshly added variant can be renamed in place.
+  final FocusNode _variantNameFocus = FocusNode();
+
+  // Product whose variants are currently expanded inline in the billing grid.
+  String? _expandedVariantProductId;
+
+  // Grid entries: normally all products; while a product's variants are
+  // expanded, the grid shows that product followed by its variant cards.
+  List<Object> get _displayGridItems {
+    final expandedId = _expandedVariantProductId;
+    if (expandedId != null) {
+      final parent = _filteredProducts.cast<Product?>().firstWhere(
+            (p) => p!.id == expandedId,
+            orElse: () => null,
+          );
+      if (parent != null && parent.variants.isNotEmpty) {
+        return <Object>[parent, ...parent.variants.map((v) => (parent, v))];
+      }
+    }
+    return List<Object>.from(_filteredProducts);
+  }
 
   // Current queued invoice number
   String _queuedInvoiceNo = '';
@@ -427,6 +452,7 @@ class _BillingScreenState extends State<BillingScreen> {
           ?.userMetadata?['logo_url'] as String? ?? '';
       _logoUrl = (s['logo_url']?.isNotEmpty == true ? s['logo_url']! : metaLogoUrl);
       _autoPrint = (s['auto_print'] ?? '0') == '1';
+      _thermalAutoCut = (s['thermal_auto_cut'] ?? '1') == '1';
       final savedPrintDocType = s['print_doc_type'] ?? _lastPrintDocType;
       _lastPrintDocType = savedPrintDocType == 'Quotation' ? 'Quotation' : 'Invoice';
       _lastPrintToPrinter = (s['print_to_printer'] ?? '0') == '1';
@@ -756,6 +782,7 @@ class _BillingScreenState extends State<BillingScreen> {
     _customPriceCtrl.dispose();
     _customNameFocus.dispose();
     _customPriceFocus.dispose();
+    _variantNameFocus.dispose();
     super.dispose();
   }
 
@@ -1345,12 +1372,28 @@ class _BillingScreenState extends State<BillingScreen> {
                         crossAxisSpacing: 20,
                         childAspectRatio: 0.72,
                       ),
-                      itemCount: _filteredProducts.length,
-                      itemBuilder: (_, i) => _ProductCard(
-                        product: _filteredProducts[i],
-                        onTap: () => cart.addProduct(_filteredProducts[i]),
-                        currencySymbol: _currencySymbol,
-                      ),
+                      itemCount: _displayGridItems.length,
+                      itemBuilder: (_, i) {
+                        final item = _displayGridItems[i];
+                        if (item is Product) {
+                          return _ProductCard(
+                            product: item,
+                            onTap: () => _onProductTap(cart, item),
+                            currencySymbol: _currencySymbol,
+                            variantsExpanded: _expandedVariantProductId == item.id,
+                            onVariantArrowTap: () => setState(() {
+                              _expandedVariantProductId =
+                                  _expandedVariantProductId == item.id ? null : item.id;
+                            }),
+                          );
+                        }
+                        final pair = item as (Product, ProductVariant);
+                        return _VariantCard(
+                          product: pair.$1,
+                          variant: pair.$2,
+                          currencySymbol: _currencySymbol,
+                        );
+                      },
                     ),
                   );
                 },
@@ -1360,6 +1403,19 @@ class _BillingScreenState extends State<BillingScreen> {
         ),
       ),
     );
+  }
+
+  // A product with variants expands its variant cards inline in the grid;
+  // a plain product is added straight to the cart.
+  void _onProductTap(CartProvider cart, Product product) {
+    if (product.hasVariants) {
+      setState(() {
+        _expandedVariantProductId =
+            _expandedVariantProductId == product.id ? null : product.id;
+      });
+    } else {
+      cart.addProduct(product);
+    }
   }
 
   // ── Right Panel ──────────────────────────────────────────────────────────────
@@ -1802,6 +1858,7 @@ class _BillingScreenState extends State<BillingScreen> {
                             : _addCustomProductBtn(cart);
                       }
                       return _CartRow(
+                          key: ValueKey(cart.items[i].lineId),
                           item: cart.items[i], cart: cart, currencySymbol: _currencySymbol);
                     },
                   ),
@@ -2757,7 +2814,9 @@ class _BillingScreenState extends State<BillingScreen> {
       _editAutoPrint = _autoPrint;
       _editInvoiceLayout = _invoiceLayout;
       _editPrintOrientation = _printOrientation;
-      _editPrinterTab = 'Regular';
+      // Tab must match the paper size, else the Paper Size dropdown's value
+      // (e.g. "3 inch") won't be among its items and DropdownButton asserts.
+      _editPrinterTab = ['A4', 'A5'].contains(_paperSize) ? 'Regular' : 'Thermal';
       _editStoreTerms = _storeTerms;
       _editLogoPath = _logoPath;
       _editLogoUrl  = _logoUrl;
@@ -4188,6 +4247,9 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   Widget _settingsDropdownRow(String label, List<String> options, String value, ValueChanged<String?> onChanged) {
+    // Guard: DropdownButton asserts if `value` isn't among `options`. Fall back
+    // to the first option so a stale value can never red-screen the app.
+    final safeValue = options.contains(value) ? value : (options.isNotEmpty ? options.first : null);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       child: Row(children: [
@@ -4198,7 +4260,7 @@ class _BillingScreenState extends State<BillingScreen> {
         Expanded(
           child: DropdownButtonHideUnderline(
             child: DropdownButton<String>(
-              value: value,
+              value: safeValue,
               items: options.map((o) => DropdownMenuItem(value: o,
                   child: Text(o, style: GoogleFonts.inter(fontSize: 13, color: const Color(0xFF1D1D1F))))).toList(),
               onChanged: onChanged,
@@ -5128,6 +5190,9 @@ class _BillingScreenState extends State<BillingScreen> {
     String paper = _paperSize;
     // Map stored paper size to Thermal/Regular
     bool isThermal = !['A4', 'A5'].contains(paper);
+    // Thermal defaults to 80mm (3 inch) unless a thermal size is already set.
+    if (isThermal && !['2 inch', '3 inch', '4 inch'].contains(paper)) paper = '3 inch';
+    bool autoCut = _thermalAutoCut;
 
     Widget printerRow(String name, {bool selected = false, required VoidCallback onTap, IconData icon = Icons.print_rounded}) {
       return InkWell(
@@ -5264,7 +5329,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   )),
                   const SizedBox(width: 10),
                   Expanded(child: GestureDetector(
-                    onTap: () => setLocal(() { isThermal = true; paper = '3 inch'; }),
+                    onTap: () => setLocal(() { isThermal = true; paper = ['2 inch','3 inch','4 inch'].contains(paper) ? paper : '3 inch'; }),
                     child: Container(
                       padding: const EdgeInsets.symmetric(vertical: 14),
                       decoration: BoxDecoration(
@@ -5282,6 +5347,60 @@ class _BillingScreenState extends State<BillingScreen> {
                   )),
                 ]),
 
+                // Thermal-only: paper width + auto-cut (for ESC/POS reliability)
+                if (isThermal) ...[
+                  const SizedBox(height: 16),
+                  _dialogSectionLabel('PAPER WIDTH'),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    for (final w in const [('2 inch', '58mm'), ('3 inch', '80mm'), ('4 inch', '112mm')]) ...[
+                      Expanded(child: GestureDetector(
+                        onTap: () => setLocal(() => paper = w.$1),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                          decoration: BoxDecoration(
+                            color: paper == w.$1 ? AppColors.primary : AppColors.surfaceVariant,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: paper == w.$1 ? AppColors.primary : AppColors.border),
+                          ),
+                          child: Center(child: Text(w.$2, style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w600,
+                              color: paper == w.$1 ? Colors.white : AppColors.textMuted))),
+                        ),
+                      )),
+                      if (w.$1 != '4 inch') const SizedBox(width: 8),
+                    ],
+                  ]),
+                  const SizedBox(height: 14),
+                  InkWell(
+                    onTap: () => setLocal(() => autoCut = !autoCut),
+                    borderRadius: BorderRadius.circular(10),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: AppColors.surfaceVariant,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: autoCut ? AppColors.primary : AppColors.border),
+                      ),
+                      child: Row(children: [
+                        Icon(Icons.content_cut_rounded, size: 16, color: autoCut ? AppColors.primary : AppColors.textMuted),
+                        const SizedBox(width: 10),
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text('Auto-cut paper', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600,
+                              color: autoCut ? AppColors.primary : AppColors.textMuted)),
+                          Text('Turn off if your printer has no cutter',
+                              style: GoogleFonts.inter(fontSize: 11, color: AppColors.textMuted)),
+                        ])),
+                        Switch(
+                          value: autoCut,
+                          onChanged: (v) => setLocal(() => autoCut = v),
+                          activeTrackColor: AppColors.primary,
+                          activeThumbColor: Colors.white,
+                        ),
+                      ]),
+                    ),
+                  ),
+                ],
+
                 const SizedBox(height: 24),
 
                 // Actions
@@ -5291,7 +5410,17 @@ class _BillingScreenState extends State<BillingScreen> {
                       child: OutlinedButton.icon(
                         onPressed: () {
                           Navigator.pop(ctx);
-                          _printRecord(_testReceipt(), paperSize: paper);
+                          // Reflect the dialog's current cutter choice in the test.
+                          _thermalAutoCut = autoCut;
+                          // Print straight to the printer selected above (in the
+                          // chosen Regular/Thermal format); only fall back to the
+                          // PDF/Preview path when "PDF Export" is the choice.
+                          if (isPdfExport || selPrinter == null) {
+                            _printRecord(_testReceipt(), paperSize: paper);
+                          } else {
+                            _printRecord(_testReceipt(), paperSize: paper,
+                                toPrinter: true, printerNameOverride: selPrinter!.name);
+                          }
                         },
                         icon: const Icon(Icons.print_outlined, size: 16),
                         label: Text('Print Test Page',
@@ -5315,10 +5444,12 @@ class _BillingScreenState extends State<BillingScreen> {
                             _activePrinter = selPrinter;
                             _selectedPrinter = printerName;
                             _paperSize = paper;
+                            _thermalAutoCut = autoCut;
                           });
                           LocalDbService.saveSettings({
                             'selected_printer': printerName,
                             'paper_size': paper,
+                            'thermal_auto_cut': autoCut ? '1' : '0',
                           });
                           Navigator.pop(ctx);
                         },
@@ -5440,8 +5571,8 @@ class _BillingScreenState extends State<BillingScreen> {
         items: cart.items
             .map((i) => TransactionItem(
                   productId: i.product.id,
-                  productName: i.product.name,
-                  price: i.product.price,
+                  productName: i.variant != null ? '${i.product.name} (${i.variant!.name})' : i.product.name,
+                  price: i.unitPrice,
                   quantity: i.quantity,
                   description: i.product.description,
                 ))
@@ -5669,11 +5800,56 @@ class _BillingScreenState extends State<BillingScreen> {
     if (mounted && _isPrinting) setState(() => _isPrinting = false);
   }
 
-  Future<void> _printRecord(TransactionRecord tx, {String? paperSize, String docType = 'Invoice', bool toPrinter = false}) async {
+  Future<void> _printRecord(TransactionRecord tx, {String? paperSize, String docType = 'Invoice', bool toPrinter = false, String? printerNameOverride}) async {
     _clearPrintingState();
     if (!mounted) return;
     setState(() => _isPrinting = true);
     _printSafetyTimer = Timer(const Duration(seconds: 30), _clearPrintingState);
+
+    final effectivePaper = paperSize ?? _paperSize;
+    final bool isThermal = effectivePaper.toLowerCase().contains('inch');
+
+    // Thermal (80mm) printers are ESC/POS. Their CUPS drivers frequently can't
+    // rasterise a PDF (some ship a Zebra ZPL driver that garbles it), so send
+    // native ESC/POS bytes straight to the queue with `lp -o raw`.
+    if (toPrinter && isThermal) {
+      try {
+        final bytes = EscPosReceipt(
+          cols: EscPosReceipt.colsForPaper(effectivePaper),
+          cut: _thermalAutoCut,
+        ).build(
+          tx,
+          storeName: _storeName, storeAddress: _storeAddress,
+          storePhone: _storePhone, storeGstin: _storeGstin,
+          receiptFooter: _receiptFooter, taxLabel: _taxLabel,
+          taxRate: _taxRateDisplay, currencySymbol: _currencySymbol,
+          storeTerms: _storeTerms, docType: docType,
+        );
+        final receiptName = tx.invoiceNumber != null
+            ? 'Receipt-${tx.invoiceNumber}'
+            : 'Receipt-${tx.id.substring(0, 6).toUpperCase()}';
+        final escFile = File('/tmp/$receiptName.escpos');
+        await escFile.writeAsBytes(bytes);
+        final target = printerNameOverride ?? _selectedPrinter;
+        // Use lpr -l (literal/raw): sends bytes unfiltered, bypassing the CUPS
+        // driver — same effect as `lp -o raw`, but lpr is the binary that the
+        // macOS app can actually spawn (lp resolves to "No such file").
+        final args = <String>['-l'];
+        if (target != 'System Default' && target != 'PDF Export' && target.isNotEmpty) {
+          args.addAll(['-P', target.replaceAll(' ', '_')]);
+        }
+        args.add(escFile.path);
+        final result = await Process.run('/usr/bin/lpr', args);
+        if (result.exitCode != 0 && mounted) {
+          _showToast('Could not print: ${result.stderr}', isError: true);
+        }
+      } catch (e) {
+        if (mounted) _showToast('Could not print: $e', isError: true);
+      } finally {
+        _clearPrintingState();
+      }
+      return;
+    }
 
     try {
       final Uint8List pdfBytes = await ReceiptPrinter.buildPdf(
@@ -5698,10 +5874,13 @@ class _BillingScreenState extends State<BillingScreen> {
       await pdfFile.writeAsBytes(pdfBytes);
       final ProcessResult result;
       if (toPrinter) {
-        // lpr sends directly to the selected printer silently — no UI opens
+        // lpr sends directly to the selected printer silently — no UI opens.
+        // printerNameOverride lets the Printer Settings "Print Test Page" target
+        // the printer picked in the dialog before it has been saved.
+        final target = printerNameOverride ?? _selectedPrinter;
         final args = <String>[];
-        if (_selectedPrinter != 'System Default' && _selectedPrinter != 'PDF Export' && _selectedPrinter.isNotEmpty) {
-          args.addAll(['-P', _selectedPrinter.replaceAll(' ', '_')]);
+        if (target != 'System Default' && target != 'PDF Export' && target.isNotEmpty) {
+          args.addAll(['-P', target.replaceAll(' ', '_')]);
         }
         args.add(pdfFile.path);
         result = await Process.run('/usr/bin/lpr', args);
@@ -8185,41 +8364,89 @@ end tell
     required void Function(int) onSelect,
     required StateSetter setLocal,
   }) {
-    return DropdownButtonFormField<int>(
-      value: selVar.clamp(-1, drafts.length - 1),
-      isExpanded: true,
-      isDense: true,
+    // No "Default" row: the base product is the rest state (box shows an
+    // "Add variant" button); when a variant is selected the box becomes an
+    // editable name field so it can be renamed in place. The suffix menu
+    // switches between existing variants and adds new ones.
+    final bool variantSelected = selVar >= 0 && selVar < drafts.length;
+
+    void addVariant() {
+      setLocal(() {
+        drafts.add(_VariantDraft());
+        onSelect(drafts.length - 1);
+      });
+      // Focus the box so the user types the new variant's name right here.
+      WidgetsBinding.instance.addPostFrameCallback((_) => _variantNameFocus.requestFocus());
+    }
+
+    // Dropdown-style menu (the ▾) to switch variants or add another.
+    Widget variantsMenu() => PopupMenuButton<int>(
+      tooltip: 'Variants',
+      padding: EdgeInsets.zero,
+      color: Colors.white,
       icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 18, color: AppColors.textMuted),
-      items: [
-        DropdownMenuItem(value: -1, child: Text('Default', style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark))),
+      onSelected: (v) {
+        if (v == -2) {
+          addVariant();
+        } else {
+          onSelect(v);
+        }
+      },
+      itemBuilder: (_) => [
         ...List.generate(drafts.length, (i) {
           final nm = drafts[i].name.text.trim().isEmpty ? 'Variant ${i + 1}' : drafts[i].name.text.trim();
-          return DropdownMenuItem(value: i, child: Text(nm, overflow: TextOverflow.ellipsis, style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark)));
+          return PopupMenuItem(value: i, child: Text(nm, overflow: TextOverflow.ellipsis, style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark)));
         }),
-        DropdownMenuItem(value: -2, child: Row(mainAxisSize: MainAxisSize.min, children: [
+        if (drafts.isNotEmpty) const PopupMenuDivider(),
+        PopupMenuItem(value: -2, child: Row(mainAxisSize: MainAxisSize.min, children: [
           const Icon(Icons.add_rounded, size: 14, color: AppColors.accentBlue),
           const SizedBox(width: 6),
           Text('Add variant', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.accentBlue)),
         ])),
       ],
-      onChanged: (v) {
-        if (v == null) return;
-        if (v == -2) {
-          setLocal(() {
-            drafts.add(_VariantDraft());
-            onSelect(drafts.length - 1);
-          });
-        } else {
-          onSelect(v);
-        }
-      },
-      decoration: _dlgInputDecor('Default'),
-      style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
-      dropdownColor: Colors.white,
+    );
+
+    if (variantSelected) {
+      // Editable name — typing renames the selected variant live.
+      return TextField(
+        controller: drafts[selVar].name,
+        focusNode: _variantNameFocus,
+        style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+        onChanged: (_) => setLocal(() {}),
+        decoration: _dlgInputDecor('Variant ${selVar + 1}').copyWith(
+          // Pencil hints that the name is editable in place.
+          prefixIcon: const Padding(
+            padding: EdgeInsets.only(left: 10, right: 4),
+            child: Icon(Icons.edit_rounded, size: 13, color: AppColors.textMuted),
+          ),
+          prefixIconConstraints: const BoxConstraints(minWidth: 0, minHeight: 0),
+          suffixIcon: variantsMenu(),
+          suffixIconConstraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+        ),
+      );
+    }
+
+    // Base product: an "Add variant" button (plus the menu if variants exist
+    // elsewhere to switch back to them).
+    return InkWell(
+      onTap: addVariant,
+      borderRadius: BorderRadius.circular(10),
+      child: InputDecorator(
+        decoration: _dlgInputDecor('').copyWith(
+          suffixIcon: drafts.isEmpty ? null : variantsMenu(),
+          suffixIconConstraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.add_rounded, size: 14, color: AppColors.accentBlue),
+          const SizedBox(width: 6),
+          Flexible(child: Text('Add variant', overflow: TextOverflow.ellipsis, style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.accentBlue))),
+        ]),
+      ),
     );
   }
 
-  /// The "Price & stock below apply to this variant · Rename · Remove" line.
+  /// The "Price & stock below apply to this variant · Remove" line.
+  /// (Renaming happens inline in the VARIANT box, so there's no Rename link.)
   Widget _variantEditNote({
     required List<_VariantDraft> drafts,
     required int selVar,
@@ -8233,11 +8460,6 @@ end tell
         Expanded(child: Text('Price & stock below apply to this variant',
             style: GoogleFonts.inter(fontSize: 11, color: AppColors.textMuted))),
         GestureDetector(
-          onTap: () => _promptRenameVariant(drafts[selVar], setLocal),
-          child: Text('Rename', style: GoogleFonts.inter(fontSize: 11.5, fontWeight: FontWeight.w600, color: AppColors.accentBlue)),
-        ),
-        const SizedBox(width: 14),
-        GestureDetector(
           onTap: () => setLocal(() {
             drafts.removeAt(selVar);
             onSelect(-1);
@@ -8245,53 +8467,6 @@ end tell
           child: Text('Remove', style: GoogleFonts.inter(fontSize: 11.5, fontWeight: FontWeight.w600, color: const Color(0xFFFF3B30))),
         ),
       ]),
-    );
-  }
-
-  void _promptRenameVariant(_VariantDraft d, StateSetter setLocal) {
-    final ctrl = TextEditingController(text: d.name.text);
-    showDialog(
-      context: context,
-      builder: (ctx) => Dialog(
-        backgroundColor: Colors.white,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: SizedBox(
-          width: 360,
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('Variant Name', style: GoogleFonts.manrope(fontSize: 16, fontWeight: FontWeight.w800, color: AppColors.textDark)),
-              const SizedBox(height: 14),
-              TextField(
-                controller: ctrl,
-                autofocus: true,
-                style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
-                decoration: _dlgInputDecor('e.g. Blue / 32GB'),
-                onSubmitted: (_) {
-                  d.name.text = ctrl.text.trim();
-                  Navigator.pop(ctx);
-                  setLocal(() {});
-                },
-              ),
-              const SizedBox(height: 18),
-              Row(children: [
-                const Spacer(),
-                TextButton(onPressed: () => Navigator.pop(ctx), child: Text('Cancel', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textMuted))),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: () {
-                    d.name.text = ctrl.text.trim();
-                    Navigator.pop(ctx);
-                    setLocal(() {});
-                  },
-                  style: ElevatedButton.styleFrom(backgroundColor: AppColors.primary, foregroundColor: Colors.white, elevation: 0, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)), padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12)),
-                  child: Text('Save', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700)),
-                ),
-              ]),
-            ]),
-          ),
-        ),
-      ),
     );
   }
 
@@ -8393,9 +8568,12 @@ end tell
     String unit = kProductUnits.contains(p.unit) ? p.unit : 'pcs';
     final barcodeNoCtrl = TextEditingController(text: p.barcodeNo);
     final supplierCtrl = TextEditingController(text: p.supplier);
-    DateTime? purchaseDate = p.purchaseDate;
+    // Fall back to today ("date of adding") when the product has no date set.
+    DateTime? purchaseDate = p.purchaseDate ?? DateTime.now();
     final variantDrafts = p.variants.map(_VariantDraft.fromVariant).toList();
-    int selVar = -1; // -1 = base product; else index into variantDrafts
+    // Show the first saved variant on open so existing variants are visible
+    // (there's no "Default" row now); -1 = base product when there are none.
+    int selVar = variantDrafts.isNotEmpty ? 0 : -1;
 
     showDialog(
       context: context,
@@ -9451,17 +9629,44 @@ end tell
   // Hardware keyboard handler — pure-digit sequences go silently to cart
   bool _handleHardwareKey(KeyEvent event) {
     if (event is! KeyDownEvent || !mounted) return false;
-    // Cmd/Ctrl+P on the Inventory tab → open the Print Barcodes dialog
-    if (event.logicalKey == LogicalKeyboardKey.keyP &&
-        (HardwareKeyboard.instance.isMetaPressed || HardwareKeyboard.instance.isControlPressed)) {
-      if (_selectedTab == 2 && ModalRoute.of(context)?.isCurrent != false) {
+    final isCmd = HardwareKeyboard.instance.isMetaPressed ||
+        HardwareKeyboard.instance.isControlPressed;
+    final noDialogOpen = ModalRoute.of(context)?.isCurrent != false;
+    // Cmd/Ctrl+P → Print Barcodes on Inventory, Print Bill on Billing
+    if (event.logicalKey == LogicalKeyboardKey.keyP && isCmd) {
+      if (_selectedTab == 2 && noDialogOpen) {
         _bulkPrintQtys = { for (final p in _products) p.id: p.stock > 0 ? p.stock : 1 };
         _bulkPrintSelected = {};
         _bulkPrinters = ['System Default'];
         _showBulkPrintDialog();
         return true;
       }
+      if (_selectedTab == 1 && noDialogOpen) {
+        if (_isPrinting) return true;
+        final cart = context.read<CartProvider>();
+        if (cart.items.isEmpty) {
+          _showToast('Cart is empty', isError: true);
+          return true;
+        }
+        _showPrintBillDialog(cart);
+        return true;
+      }
       return false;
+    }
+    // Cmd/Ctrl+C on Billing → Paid - Close Bill. Real copy still wins whenever
+    // text is actually selected, so this never eats a deliberate Cmd+C.
+    if (event.logicalKey == LogicalKeyboardKey.keyC && isCmd) {
+      if (_selectedTab != 1 || !noDialogOpen) return false;
+      final focused = FocusManager.instance.primaryFocus?.context?.widget;
+      if (focused is EditableText &&
+          !focused.controller.selection.isCollapsed) return false;
+      final cart = context.read<CartProvider>();
+      if (cart.items.isEmpty) {
+        _showToast('Cart is empty', isError: true);
+        return true;
+      }
+      _closeBill(context, cart);
+      return true;
     }
     // Only on billing tab (tab 1), not inside a dialog
     if (_selectedTab != 1) return false;
@@ -12165,7 +12370,15 @@ class _ProductCard extends StatefulWidget {
   final Product product;
   final VoidCallback onTap;
   final String currencySymbol;
-  const _ProductCard({required this.product, required this.onTap, required this.currencySymbol});
+  final bool variantsExpanded;
+  final VoidCallback? onVariantArrowTap;
+  const _ProductCard({
+    required this.product,
+    required this.onTap,
+    required this.currencySymbol,
+    this.variantsExpanded = false,
+    this.onVariantArrowTap,
+  });
   @override
   State<_ProductCard> createState() => _ProductCardState();
 }
@@ -12175,36 +12388,21 @@ class _ProductCardState extends State<_ProductCard> {
 
   @override
   Widget build(BuildContext context) {
-    final cart = context.watch<CartProvider>();
-    final inCart = cart.quantityInCart(widget.product.id);
-    final outOfStock = (widget.product.stock - inCart) <= 0;
+    final variants = widget.product.variants;
     return MouseRegion(
-        onEnter: (_) => setState(() => _hovered = true),
-        onExit: (_) => setState(() => _hovered = false),
-        child: GestureDetector(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
         onTap: widget.onTap,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 200),
           decoration: BoxDecoration(
             color: Colors.white,
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-                color:
-                    _hovered ? AppColors.accentBlue : AppColors.border),
+            border: Border.all(color: _hovered ? AppColors.accentBlue : AppColors.border),
             boxShadow: _hovered
-                ? [
-                    BoxShadow(
-                        color: AppColors.primary
-                            .withValues(alpha: 0.12),
-                        blurRadius: 12,
-                        offset: const Offset(0, 4)),
-                  ]
-                : [
-                    BoxShadow(
-                        color: AppColors.cardShadow,
-                        blurRadius: 4,
-                        offset: const Offset(0, 2)),
-                  ],
+                ? [BoxShadow(color: AppColors.primary.withValues(alpha: 0.12), blurRadius: 12, offset: const Offset(0, 4))]
+                : [BoxShadow(color: AppColors.cardShadow, blurRadius: 4, offset: const Offset(0, 2))],
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -12218,60 +12416,90 @@ class _ProductCardState extends State<_ProductCard> {
                           ? ClipRRect(
                               borderRadius: const BorderRadius.vertical(top: Radius.circular(15)),
                               child: Image.file(File(widget.product.emoji),
-                                  width: double.infinity,
-                                  height: double.infinity,
-                                  fit: BoxFit.cover,
+                                  width: double.infinity, height: double.infinity, fit: BoxFit.cover,
                                   errorBuilder: (_, __, ___) => _ProductInitialsBox(name: widget.product.name, radius: 15)))
                           : _ProductInitialsBox(name: widget.product.name, radius: 15),
                     ),
                     Consumer<CartProvider>(
                       builder: (_, cart, __) {
+                        final hasVariants = variants.isNotEmpty;
+                        final totalStock = hasVariants ? variants.fold<int>(0, (s, v) => s + v.stock) : widget.product.stock;
                         final inCart = cart.quantityInCart(widget.product.id);
-                        final remaining = (widget.product.stock - inCart).clamp(0, widget.product.stock);
+                        final remaining = (totalStock - inCart).clamp(0, totalStock);
                         final outOfStock = remaining == 0;
                         return Stack(children: [
                           Positioned(
-                            top: 10,
-                            right: 10,
+                            top: 10, right: 10,
                             child: Container(
                               padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: outOfStock ? AppColors.error : AppColors.primary,
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                  outOfStock ? 'OUT OF STOCK' : 'STOCK: ${remaining.toString().padLeft(2, '0')}',
-                                  style: GoogleFonts.inter(
-                                      fontSize: 9,
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.w700,
-                                      letterSpacing: 0.5)),
+                              decoration: BoxDecoration(color: outOfStock ? AppColors.error : AppColors.primary, borderRadius: BorderRadius.circular(4)),
+                              child: Text(outOfStock ? 'OUT OF STOCK' : 'STOCK: ${remaining.toString().padLeft(2, '0')}',
+                                  style: GoogleFonts.inter(fontSize: 9, color: Colors.white, fontWeight: FontWeight.w700, letterSpacing: 0.5)),
                             ),
                           ),
-                          // Add button on hover
+                          // Add / tune button on hover
                           Positioned(
-                            bottom: 10,
-                            right: 10,
+                            bottom: 10, right: 10,
                             child: AnimatedOpacity(
                               duration: const Duration(milliseconds: 200),
                               opacity: _hovered ? 1.0 : 0.0,
                               child: Container(
-                                width: 36,
-                                height: 36,
+                                width: 36, height: 36,
                                 decoration: BoxDecoration(
                                   color: outOfStock ? AppColors.textMuted : AppColors.accentBlue,
                                   shape: BoxShape.circle,
-                                  boxShadow: outOfStock ? [] : [
-                                    BoxShadow(
-                                        color: AppColors.accentBlue.withValues(alpha: 0.35),
-                                        blurRadius: 8,
-                                        offset: const Offset(0, 2)),
-                                  ],
+                                  boxShadow: outOfStock ? [] : [BoxShadow(color: AppColors.accentBlue.withValues(alpha: 0.35), blurRadius: 8, offset: const Offset(0, 2))],
                                 ),
-                                child: const Icon(Icons.add, color: Colors.white, size: 20),
+                                child: Icon(hasVariants ? Icons.tune_rounded : Icons.add, color: Colors.white, size: 20),
                               ),
                             ),
                           ),
+                          // Variant name chips
+                          if (hasVariants)
+                            Positioned(
+                              left: 8, bottom: 8, right: 52,
+                              child: Wrap(spacing: 3, runSpacing: 3, children: [
+                                ...variants.take(3).map((v) {
+                                  final vInCart = cart.quantityInCartForVariant(widget.product.id, v.id);
+                                  final vOut = (v.stock - vInCart) <= 0;
+                                  return Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                                    decoration: BoxDecoration(color: vOut ? AppColors.error : AppColors.success, borderRadius: BorderRadius.circular(4)),
+                                    child: Text(v.name.isEmpty ? 'Variant' : v.name, style: GoogleFonts.inter(fontSize: 8, color: Colors.white, fontWeight: FontWeight.w700)),
+                                  );
+                                }),
+                                if (variants.length > 3)
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                                    decoration: BoxDecoration(color: AppColors.textMuted, borderRadius: BorderRadius.circular(4)),
+                                    child: Text('+${variants.length - 3}', style: GoogleFonts.inter(fontSize: 8, color: Colors.white, fontWeight: FontWeight.w700)),
+                                  ),
+                              ]),
+                            ),
+                          // Slide arrow to expand/collapse variant cards
+                          if (hasVariants)
+                            Positioned(
+                              right: 6, top: 0, bottom: 0,
+                              child: Center(
+                                child: GestureDetector(
+                                  onTap: widget.onVariantArrowTap,
+                                  child: Container(
+                                    width: 24, height: 24,
+                                    decoration: BoxDecoration(
+                                      color: widget.variantsExpanded ? AppColors.primary : Colors.white,
+                                      shape: BoxShape.circle,
+                                      border: Border.all(color: AppColors.border),
+                                      boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.12), blurRadius: 4, offset: const Offset(0, 1))],
+                                    ),
+                                    child: AnimatedRotation(
+                                      turns: widget.variantsExpanded ? 0.5 : 0,
+                                      duration: const Duration(milliseconds: 200),
+                                      child: Icon(Icons.chevron_right_rounded, size: 18, color: widget.variantsExpanded ? Colors.white : AppColors.primary),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
                         ]);
                       },
                     ),
@@ -12284,35 +12512,139 @@ class _ProductCardState extends State<_ProductCard> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(widget.product.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: GoogleFonts.manrope(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w700,
-                            color: AppColors.primary,
-                            letterSpacing: 0.1)),
+                    Text(widget.product.name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.primary, letterSpacing: 0.1)),
                     const SizedBox(height: 2),
-                    Text(
-                        'SKU: ${widget.product.sku}'.toUpperCase(),
-                        style: GoogleFonts.inter(
-                            fontSize: 9,
-                            fontWeight: FontWeight.w300,
-                            color: AppColors.textMuted
-                                .withValues(alpha: 0.7),
-                            letterSpacing: 0.8)),
+                    Text('SKU: ${widget.product.sku}'.toUpperCase(),
+                        style: GoogleFonts.inter(fontSize: 9, fontWeight: FontWeight.w300, color: AppColors.textMuted.withValues(alpha: 0.7), letterSpacing: 0.8)),
                     const SizedBox(height: 8),
-                    Text(
-                        '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}',
-                        style: GoogleFonts.manrope(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w900,
-                            color: AppColors.primary,
-                            letterSpacing: -0.5)),
+                    // Base price, or a price range when variants differ.
+                    Text(() {
+                      if (variants.isEmpty) return '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}';
+                      final prices = variants.map((v) => v.price).toList()..sort();
+                      return prices.first == prices.last
+                          ? '${widget.currencySymbol}${prices.first.toStringAsFixed(2)}'
+                          : '${widget.currencySymbol}${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
+                    }(), style: GoogleFonts.manrope(fontSize: 16, fontWeight: FontWeight.w900, color: AppColors.primary, letterSpacing: -0.5)),
                   ],
                 ),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Variant Card (slides out beside its product in the grid) ────────────────
+
+class _VariantCard extends StatefulWidget {
+  final Product product;
+  final ProductVariant variant;
+  final String currencySymbol;
+  const _VariantCard({
+    required this.product,
+    required this.variant,
+    required this.currencySymbol,
+  });
+  @override
+  State<_VariantCard> createState() => _VariantCardState();
+}
+
+class _VariantCardState extends State<_VariantCard> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final cart = context.watch<CartProvider>();
+    final inCart = cart.quantityInCartForVariant(widget.product.id, widget.variant.id);
+    final remaining = (widget.variant.stock - inCart).clamp(0, widget.variant.stock);
+    final outOfStock = remaining == 0;
+    final label = widget.variant.name.isEmpty ? 'Variant' : widget.variant.name;
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.0, end: 1.0),
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeOutCubic,
+      builder: (context, t, child) => Opacity(opacity: t, child: Transform.translate(offset: Offset(28 * (1 - t), 0), child: child)),
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: GestureDetector(
+          // Tap always adds (matches non-variant product cards, which aren't
+          // stock-gated); the OUT OF STOCK badge stays as a visual warning.
+          onTap: () => context.read<CartProvider>().addProduct(widget.product, variant: widget.variant),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: _hovered ? AppColors.accentBlue : AppColors.border),
+              boxShadow: _hovered
+                  ? [BoxShadow(color: AppColors.primary.withValues(alpha: 0.12), blurRadius: 12, offset: const Offset(0, 4))]
+                  : [BoxShadow(color: AppColors.cardShadow, blurRadius: 4, offset: const Offset(0, 2))],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Stack(children: [
+                    Positioned.fill(
+                      child: widget.product.emoji.startsWith('/')
+                          ? ClipRRect(borderRadius: const BorderRadius.vertical(top: Radius.circular(15)),
+                              child: Image.file(File(widget.product.emoji), width: double.infinity, height: double.infinity, fit: BoxFit.cover,
+                                  errorBuilder: (_, __, ___) => _ProductInitialsBox(name: label, radius: 15)))
+                          : _ProductInitialsBox(name: label, radius: 15),
+                    ),
+                    Positioned(top: 10, right: 10,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                        decoration: BoxDecoration(color: outOfStock ? AppColors.error : AppColors.primary, borderRadius: BorderRadius.circular(4)),
+                        child: Text(outOfStock ? 'OUT OF STOCK' : 'STOCK: ${remaining.toString().padLeft(2, '0')}',
+                            style: GoogleFonts.inter(fontSize: 9, color: Colors.white, fontWeight: FontWeight.w700, letterSpacing: 0.5)),
+                      ),
+                    ),
+                    Positioned(top: 10, left: 10,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                        decoration: BoxDecoration(color: const Color(0xFF6366F1), borderRadius: BorderRadius.circular(4)),
+                        child: Text('VARIANT', style: GoogleFonts.inter(fontSize: 8, color: Colors.white, fontWeight: FontWeight.w700, letterSpacing: 0.5)),
+                      ),
+                    ),
+                    Positioned(bottom: 10, right: 10,
+                      child: AnimatedOpacity(
+                        duration: const Duration(milliseconds: 200),
+                        opacity: _hovered ? 1.0 : 0.0,
+                        child: Container(
+                          width: 36, height: 36,
+                          decoration: BoxDecoration(
+                            color: outOfStock ? AppColors.textMuted : AppColors.accentBlue, shape: BoxShape.circle,
+                            boxShadow: outOfStock ? [] : [BoxShadow(color: AppColors.accentBlue.withValues(alpha: 0.35), blurRadius: 8, offset: const Offset(0, 2))],
+                          ),
+                          child: const Icon(Icons.add, color: Colors.white, size: 20),
+                        ),
+                      ),
+                    ),
+                  ]),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(label, maxLines: 1, overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.primary, letterSpacing: 0.1)),
+                      const SizedBox(height: 2),
+                      Text(widget.product.name.toUpperCase(), maxLines: 1, overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.inter(fontSize: 9, fontWeight: FontWeight.w300, color: AppColors.textMuted.withValues(alpha: 0.7), letterSpacing: 0.8)),
+                      const SizedBox(height: 8),
+                      Text('${widget.currencySymbol}${widget.variant.price.toStringAsFixed(2)}',
+                          style: GoogleFonts.manrope(fontSize: 16, fontWeight: FontWeight.w900, color: AppColors.primary, letterSpacing: -0.5)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -12326,7 +12658,7 @@ class _CartRow extends StatefulWidget {
   final CartItem item;
   final CartProvider cart;
   final String currencySymbol;
-  const _CartRow({required this.item, required this.cart, required this.currencySymbol});
+  const _CartRow({super.key, required this.item, required this.cart, required this.currencySymbol});
   @override
   State<_CartRow> createState() => _CartRowState();
 }
@@ -12355,9 +12687,9 @@ class _CartRowState extends State<_CartRow> {
   void _commitEdit() {
     final v = int.tryParse(_qtyCtrl.text.trim()) ?? 0;
     if (v > 0) {
-      widget.cart.setQuantity(widget.item.product.id, v, stock: widget.item.product.stock);
+      widget.cart.setQuantity(widget.item.lineId, v, stock: widget.item.availableStock);
     } else {
-      widget.cart.removeItem(widget.item.product.id);
+      widget.cart.removeItem(widget.item.lineId);
     }
     if (mounted) setState(() => _editing = false);
   }
@@ -12373,12 +12705,15 @@ class _CartRowState extends State<_CartRow> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(widget.item.product.name,
+                Text(
+                    widget.item.variant != null
+                        ? '${widget.item.product.name} · ${widget.item.variant!.name}'
+                        : widget.item.product.name,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.primary)),
                 const SizedBox(height: 2),
-                Text('SKU: ${widget.item.product.sku}'.toUpperCase(),
+                Text('SKU: ${widget.item.displaySku}'.toUpperCase(),
                     style: GoogleFonts.inter(fontSize: 10, fontWeight: FontWeight.w300,
                         color: AppColors.textMuted.withValues(alpha: 0.6), letterSpacing: 0.5)),
               ],
@@ -12396,7 +12731,7 @@ class _CartRowState extends State<_CartRow> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                _qtyBtn(Icons.remove, () => widget.cart.decrement(widget.item.product.id)),
+                _qtyBtn(Icons.remove, () => widget.cart.decrement(widget.item.lineId)),
                 GestureDetector(
                   onTap: () {
                     setState(() => _editing = true);
@@ -12423,7 +12758,7 @@ class _CartRowState extends State<_CartRow> {
                             style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.primary)),
                   ),
                 ),
-                _qtyBtn(Icons.add, () => widget.cart.increment(widget.item.product.id, stock: widget.item.product.stock)),
+                _qtyBtn(Icons.add, () => widget.cart.increment(widget.item.lineId, stock: widget.item.availableStock)),
               ],
             ),
           ),
@@ -12435,14 +12770,14 @@ class _CartRowState extends State<_CartRow> {
               children: [
                 Text('${widget.currencySymbol}${widget.item.total.toStringAsFixed(2)}',
                     style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.primary)),
-                Text('${widget.currencySymbol}${widget.item.product.price.toStringAsFixed(2)}/${widget.item.product.unit}',
+                Text('${widget.currencySymbol}${widget.item.unitPrice.toStringAsFixed(2)}/${widget.item.product.unit}',
                     style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted.withValues(alpha: 0.6), fontWeight: FontWeight.w300)),
               ],
             ),
           ),
           const SizedBox(width: 8),
           GestureDetector(
-            onTap: () => widget.cart.removeItem(widget.item.product.id),
+            onTap: () => widget.cart.removeItem(widget.item.lineId),
             child: Icon(Icons.close_rounded, size: 18, color: AppColors.textMuted.withValues(alpha: 0.5)),
           ),
         ],

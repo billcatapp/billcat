@@ -69,8 +69,15 @@ class _BillCatAppState extends State<BillCatApp> {
     Supabase.instance.client.auth.onAuthStateChange.listen((data) async {
       final user = data.session?.user;
       if (data.event == AuthChangeEvent.signedIn && user != null) {
+        // `signedIn` also fires on token refresh / session restore for the SAME
+        // user — clearing then would wipe local data that hasn't synced yet.
+        // Only wipe when a genuinely different account signs in.
+        final switchingAccount = LocalDbService.currentUserId != null &&
+            LocalDbService.currentUserId != user.id;
         await LocalDbService.initForUser(user.id);
-        await LocalDbService.clearAll();
+        if (switchingAccount) {
+          await LocalDbService.clearAll();
+        }
         await ConnectivityService.instance.pullFromCloud();
 
         final provider = user.appMetadata['provider'] as String?;

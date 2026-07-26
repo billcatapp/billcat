@@ -164,4 +164,13 @@ class CartItem {
 
   double get unitPrice => variant?.price ?? product.price;
   double get total => unitPrice * quantity;
+
+  /// Unique key for a cart line. Two variants of the same product are distinct
+  /// lines; a base (variant-less) product keeps its plain product id, so
+  /// existing non-variant behaviour is unchanged.
+  String get lineId => variant == null ? product.id : '${product.id}::${variant!.id}';
+
+  /// Stock and SKU reflect the variant when one is selected.
+  int get availableStock => variant?.stock ?? product.stock;
+  String get displaySku => variant?.sku ?? product.sku;
 }

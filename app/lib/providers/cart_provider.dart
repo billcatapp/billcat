@@ -37,28 +37,35 @@ class CartProvider extends ChangeNotifier {
   double get taxAmount => (subtotal - discountAmount) * (taxRate / 100);
   double get total => subtotal - discountAmount + taxAmount;
 
-  int quantityInCart(String productId) {
-    final i = _items.indexWhere((e) => e.product.id == productId);
+  /// Total quantity of a product across all its variant lines (used by the
+  /// product card badge and stock display).
+  int quantityInCart(String productId) =>
+      _items.where((e) => e.product.id == productId).fold(0, (s, e) => s + e.quantity);
+
+  /// Quantity in cart for one specific variant of a product.
+  int quantityInCartForVariant(String productId, String variantId) {
+    final i = _items.indexWhere((e) => e.product.id == productId && e.variant?.id == variantId);
     return i >= 0 ? _items[i].quantity : 0;
   }
 
-  void addProduct(Product product) {
-    final i = _items.indexWhere((e) => e.product.id == product.id);
+  void addProduct(Product product, {ProductVariant? variant}) {
+    final item = CartItem(product: product, variant: variant);
+    final i = _items.indexWhere((e) => e.lineId == item.lineId);
     if (i >= 0) {
       _items[i].quantity++;
     } else {
-      _items.add(CartItem(product: product));
+      _items.add(item);
     }
     notifyListeners();
   }
 
-  void increment(String productId, {int stock = 999999}) {
-    final i = _items.indexWhere((e) => e.product.id == productId);
+  void increment(String lineId, {int stock = 999999}) {
+    final i = _items.indexWhere((e) => e.lineId == lineId);
     if (i >= 0 && _items[i].quantity < stock) { _items[i].quantity++; notifyListeners(); }
   }
 
-  void decrement(String productId) {
-    final i = _items.indexWhere((e) => e.product.id == productId);
+  void decrement(String lineId) {
+    final i = _items.indexWhere((e) => e.lineId == lineId);
     if (i >= 0) {
       if (_items[i].quantity > 1) {
         _items[i].quantity--;
@@ -69,16 +76,16 @@ class CartProvider extends ChangeNotifier {
     }
   }
 
-  void setQuantity(String productId, int qty, {int stock = 999999}) {
-    final i = _items.indexWhere((e) => e.product.id == productId);
+  void setQuantity(String lineId, int qty, {int stock = 999999}) {
+    final i = _items.indexWhere((e) => e.lineId == lineId);
     if (i >= 0) {
       _items[i].quantity = qty.clamp(1, stock);
       notifyListeners();
     }
   }
 
-  void removeItem(String productId) {
-    _items.removeWhere((e) => e.product.id == productId);
+  void removeItem(String lineId) {
+    _items.removeWhere((e) => e.lineId == lineId);
     notifyListeners();
   }
 

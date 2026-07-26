@@ -12,6 +12,9 @@ class LocalDbService {
   static Database? _db;
   static String? _currentUserId;
 
+  /// The user whose local DB is currently open (null before any init).
+  static String? get currentUserId => _currentUserId;
+
   static Future<void> initForUser(String userId) async {
     if (_currentUserId == userId && _db != null) return;
     await _db?.close();
@@ -316,13 +319,11 @@ class LocalDbService {
 
   static Future<void> updateProduct(Product p) async {
     final database = await db;
-    await database.update('products', {
-      'name': p.name, 'price': p.price, 'buying_price': p.buyingPrice,
-      'tax_percent': p.taxPercent, 'category': p.category,
-      'emoji': p.emoji, 'sku': p.sku, 'stock': p.stock,
-      'description': p.description, 'unit': p.unit,
-      'barcode_no': p.barcodeNo, 'synced': 0,
-    }, where: 'id = ?', whereArgs: [p.id]);
+    // Use the full map so supplier, purchase_date and variants persist too —
+    // a hand-picked column list silently dropped them on edit. toMap() sets
+    // synced: 0, marking the row dirty for the next cloud push.
+    await database.update('products', p.toMap(),
+        where: 'id = ?', whereArgs: [p.id]);
   }
 
   static Future<String> getNextBarcodeNo() async {

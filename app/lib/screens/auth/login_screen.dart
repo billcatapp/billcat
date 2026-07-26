@@ -66,8 +66,14 @@ class _LoginScreenState extends State<LoginScreen> {
       if (!mounted) return;
       final userId = response.user?.id;
       if (userId != null) {
+        // Only wipe local data when a different account signs in; the same user
+        // re-authenticating must keep any not-yet-synced local changes.
+        final switchingAccount = LocalDbService.currentUserId != null &&
+            LocalDbService.currentUserId != userId;
         await LocalDbService.initForUser(userId);
-        await LocalDbService.clearAll();
+        if (switchingAccount) {
+          await LocalDbService.clearAll();
+        }
         await ConnectivityService.instance.pullFromCloud();
       }
       if (!mounted) return;
