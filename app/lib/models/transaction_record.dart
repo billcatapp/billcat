@@ -7,12 +7,17 @@ class TransactionItem {
   final int quantity;
   final String description;
 
+  /// Which variant of the product was sold, if any. Stored inside the
+  /// transaction's `items` JSON, so adding it needs no DB/cloud schema change.
+  final String? variantId;
+
   const TransactionItem({
     required this.productId,
     required this.productName,
     required this.price,
     required this.quantity,
     this.description = '',
+    this.variantId,
   });
 
   double get total => price * quantity;
@@ -23,6 +28,7 @@ class TransactionItem {
     'price': price,
     'quantity': quantity,
     'description': description,
+    'variantId': variantId,
   };
 
   factory TransactionItem.fromMap(Map<String, dynamic> m) => TransactionItem(
@@ -31,6 +37,7 @@ class TransactionItem {
     price: (m['price'] as num).toDouble(),
     quantity: m['quantity'] as int,
     description: (m['description'] as String?) ?? '',
+    variantId: m['variantId'] as String?,
   );
 }
 

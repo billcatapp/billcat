@@ -388,20 +388,41 @@ class LocalDbService {
     final database = await db;
     await database.insert('transactions', t.toMap(),
         conflictAlgorithm: ConflictAlgorithm.replace);
-    // Deduct stock for each sold item and mark product unsynced for cloud push
+    // Deduct stock for each sold item and mark product unsynced for cloud push.
     for (final item in t.items) {
       final rows = await database.query('products',
           where: 'id = ?', whereArgs: [item.productId], limit: 1);
-      if (rows.isNotEmpty) {
-        final current = rows.first['stock'] as int;
-        final updated = (current - item.quantity).clamp(0, current);
-        await database.update(
-          'products',
-          {'stock': updated, 'synced': 0},
-          where: 'id = ?',
-          whereArgs: [item.productId],
-        );
+      if (rows.isEmpty) continue;
+      final row = rows.first;
+
+      // Variant sale: deduct that variant's stock and keep the base product
+      // stock equal to the sum of its variants.
+      if (item.variantId != null) {
+        final variants = decodeVariants(row['variants']);
+        final idx = variants.indexWhere((v) => v.id == item.variantId);
+        if (idx != -1) {
+          final v = variants[idx];
+          variants[idx] = v.copyWith(stock: (v.stock - item.quantity).clamp(0, v.stock));
+          final sum = variants.fold<int>(0, (s, v) => s + v.stock);
+          await database.update(
+            'products',
+            {'variants': encodeVariants(variants), 'stock': sum, 'synced': 0},
+            where: 'id = ?',
+            whereArgs: [item.productId],
+          );
+          continue;
+        }
       }
+
+      // Plain product (or variant no longer present): deduct the base stock.
+      final current = row['stock'] as int;
+      final updated = (current - item.quantity).clamp(0, current);
+      await database.update(
+        'products',
+        {'stock': updated, 'synced': 0},
+        where: 'id = ?',
+        whereArgs: [item.productId],
+      );
     }
     if (t.customerName != null && t.customerName!.isNotEmpty) {
       await upsertCustomerByPhone(name: t.customerName!, phone: t.customerPhone);

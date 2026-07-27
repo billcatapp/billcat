@@ -107,10 +107,11 @@ class CartProvider extends ChangeNotifier {
       customerPhone: customerPhone.isEmpty ? null : customerPhone,
       items: _items.map((i) => TransactionItem(
         productId: i.product.id,
-        productName: i.product.name,
-        price: i.product.price,
+        productName: i.variant != null ? '${i.product.name} (${i.variant!.name})' : i.product.name,
+        price: i.unitPrice,
         quantity: i.quantity,
         description: i.product.description,
+        variantId: i.variant?.id,
       )).toList(),
       subtotal: subtotal,
       discountAmount: discountAmount,

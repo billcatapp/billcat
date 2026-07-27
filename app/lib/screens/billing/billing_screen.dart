@@ -6804,13 +6804,37 @@ end tell
 
   TextStyle _fieldMiniLabel() => GoogleFonts.inter(fontSize: 10, fontWeight: FontWeight.w600, color: AppColors.textMuted, letterSpacing: 0.6);
 
+  /// Expands products into one printable barcode label per variant (each with
+  /// its own SKU, barcode and price); a product without variants yields one.
+  List<_BarcodeTarget> _barcodeTargets() {
+    final out = <_BarcodeTarget>[];
+    for (final p in _products) {
+      if (p.variants.isEmpty) {
+        out.add(_BarcodeTarget(
+          key: p.id, name: p.name, sku: p.sku,
+          barcodeValue: p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku,
+          stock: p.stock, price: p.price));
+      } else {
+        for (final v in p.variants) {
+          final vsku = v.sku.isNotEmpty ? v.sku : p.sku;
+          out.add(_BarcodeTarget(
+            key: '${p.id}::${v.id}', name: '${p.name} ${v.name}', sku: vsku,
+            barcodeValue: v.barcodeNo.isNotEmpty ? v.barcodeNo : vsku,
+            stock: v.stock, price: v.price));
+        }
+      }
+    }
+    return out;
+  }
+
   void _showBulkPrintDialog() {
     final labelWCtrl  = TextEditingController(text: _barcodeLabelW.toStringAsFixed(_barcodeLabelW == _barcodeLabelW.truncateToDouble() ? 0 : 1));
     final labelHCtrl  = TextEditingController(text: _barcodeLabelH.toStringAsFixed(_barcodeLabelH == _barcodeLabelH.truncateToDouble() ? 0 : 1));
     final perRowCtrl  = TextEditingController(text: '$_barcodePerRow');
     final searchCtrl  = TextEditingController();
-    final qtys        = Map<String, int>.from(_bulkPrintQtys);
-    final selected    = Map<String, bool>.from(_bulkPrintSelected);
+    final targets     = _barcodeTargets();
+    final qtys        = <String, int>{ for (final t in targets) t.key: t.stock > 0 ? t.stock : 1 };
+    final selected    = <String, bool>{};
     var printers      = <String>['System Default'];
     var printerObjects = <Printer>[];
     var printerStatus = <String, String>{}; // name → 'online' | 'paused' | 'offline'
@@ -6818,9 +6842,9 @@ end tell
     String searchQ    = '';
     Timer? statusTimer;
 
-    // Per-product qty TextEditingControllers
+    // Per-label qty controllers, keyed by target (product or variant).
     final qtyCtrlMap = <String, TextEditingController>{
-      for (final p in _products) p.id: TextEditingController(text: '${qtys[p.id] ?? 1}'),
+      for (final t in targets) t.key: TextEditingController(text: '${qtys[t.key]}'),
     };
 
     showDialog(
@@ -6847,13 +6871,13 @@ end tell
             statusTimer?.cancel();
           }
         });
-        final filteredProducts = searchQ.isEmpty
-          ? _products
-          : _products.where((p) {
+        final filteredTargets = searchQ.isEmpty
+          ? targets
+          : targets.where((t) {
               final q = searchQ.toLowerCase();
-              return p.name.toLowerCase().contains(q) || p.sku.toLowerCase().contains(q);
+              return t.name.toLowerCase().contains(q) || t.sku.toLowerCase().contains(q);
             }).toList();
-        final total = _products.where((p) => selected[p.id] == true).fold<int>(0, (s, p) => s + (qtys[p.id] ?? 0));
+        final total = targets.where((t) => selected[t.key] == true).fold<int>(0, (s, t) => s + (qtys[t.key] ?? 0));
 
         Future<void> doPrint() async {
           if (!(total > 0 && printerStatus[printer] != 'offline')) return;
@@ -6863,8 +6887,8 @@ end tell
           Navigator.pop(ctx);
           setState(() { _barcodeLabelW = w; _barcodeLabelH = h; _barcodePerRow = perRow; _barcodePrinter = printer; });
           LabelPrinterService.saveBarcodeSettings({'labelW': w, 'labelH': h, 'perRow': perRow, 'printer': printer});
-          final selProducts = _products.where((p) => selected[p.id] == true).toList();
-          await _printAllBarcodesWithQty(selProducts, qtys, labelW: w, labelH: h, labelsPerRow: perRow, printerName: printer);
+          final selTargets = targets.where((t) => selected[t.key] == true).toList();
+          await _printAllBarcodesWithQty(selTargets, qtys, labelW: w, labelH: h, labelsPerRow: perRow, printerName: printer);
         }
 
         return CallbackShortcuts(
@@ -7010,7 +7034,7 @@ end tell
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxHeight: 340),
-                  child: filteredProducts.isEmpty
+                  child: filteredTargets.isEmpty
                     ? Padding(
                         padding: const EdgeInsets.symmetric(vertical: 32),
                         child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -7027,22 +7051,22 @@ end tell
                           mainAxisSpacing: 10,
                           childAspectRatio: 1.3,
                         ),
-                        itemCount: filteredProducts.length,
+                        itemCount: filteredTargets.length,
                         itemBuilder: (_, i) {
-                          final p = filteredProducts[i];
-                          final isSelected = selected[p.id] == true;
-                          final qty = qtys[p.id] ?? 1;
-                          final qtyCtrl = qtyCtrlMap[p.id] ??= TextEditingController(text: '$qty');
+                          final t = filteredTargets[i];
+                          final isSelected = selected[t.key] == true;
+                          final qty = qtys[t.key] ?? 1;
+                          final qtyCtrl = qtyCtrlMap[t.key] ??= TextEditingController(text: '$qty');
                           return GestureDetector(
                             onTap: () {
                               setLocal(() {
                                 if (isSelected) {
-                                  selected[p.id] = false;
+                                  selected[t.key] = false;
                                 } else {
-                                  selected[p.id] = true;
-                                  if (!qtys.containsKey(p.id)) {
-                                    qtys[p.id] = p.stock > 0 ? p.stock : 1;
-                                    qtyCtrlMap[p.id]?.text = '${qtys[p.id]}';
+                                  selected[t.key] = true;
+                                  if (!qtys.containsKey(t.key)) {
+                                    qtys[t.key] = t.stock > 0 ? t.stock : 1;
+                                    qtyCtrlMap[t.key]?.text = '${qtys[t.key]}';
                                   }
                                 }
                               });
@@ -7062,7 +7086,7 @@ end tell
                                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                                     Padding(
                                       padding: const EdgeInsets.only(right: 14),
-                                      child: Text(p.name,
+                                      child: Text(t.name,
                                         style: GoogleFonts.inter(fontSize: 11, fontWeight: FontWeight.w600,
                                           color: isSelected ? AppColors.primary : AppColors.textDark),
                                         maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -7071,16 +7095,19 @@ end tell
                                     Container(
                                       width: double.infinity, height: 30,
                                       decoration: BoxDecoration(color: const Color(0xFFF5F5F5), borderRadius: BorderRadius.circular(5)),
-                                      child: CustomPaint(painter: _BarcodePainter(p.sku))),
+                                      child: CustomPaint(painter: _BarcodePainter(t.barcodeValue))),
                                     const SizedBox(height: 4),
-                                    Text(p.sku, style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted)),
+                                    Row(children: [
+                                      Expanded(child: Text(t.sku, style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted), maxLines: 1, overflow: TextOverflow.ellipsis)),
+                                      Text('$_currencySymbol${t.price.toStringAsFixed(2)}', style: GoogleFonts.inter(fontSize: 9, fontWeight: FontWeight.w700, color: AppColors.textDark)),
+                                    ]),
                                     const Spacer(),
                                     if (isSelected) Container(
                                       height: 28,
                                       decoration: BoxDecoration(color: AppColors.surfaceVariant, borderRadius: BorderRadius.circular(7)),
                                       child: Row(children: [
                                         InkWell(
-                                          onTap: qty > 1 ? () { setLocal(() => qtys[p.id] = qty - 1); qtyCtrl.text = '${qty - 1}'; } : null,
+                                          onTap: qty > 1 ? () { setLocal(() => qtys[t.key] = qty - 1); qtyCtrl.text = '${qty - 1}'; } : null,
                                           borderRadius: const BorderRadius.horizontal(left: Radius.circular(6)),
                                           child: Container(width: 26, height: 28, alignment: Alignment.center,
                                             child: Icon(Icons.remove_rounded, size: 11, color: qty > 1 ? AppColors.textDark : AppColors.textMuted))),
@@ -7092,18 +7119,18 @@ end tell
                                           textAlign: TextAlign.center,
                                           style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w700, color: AppColors.textDark),
                                           decoration: const InputDecoration(isDense: true, border: InputBorder.none, contentPadding: EdgeInsets.zero),
-                                          onChanged: (v) { final n = int.tryParse(v); if (n != null && n > 0) setLocal(() => qtys[p.id] = n); },
+                                          onChanged: (v) { final n = int.tryParse(v); if (n != null && n > 0) setLocal(() => qtys[t.key] = n); },
                                         )),
                                         Container(width: 1, height: 16, color: AppColors.border),
                                         InkWell(
-                                          onTap: () { setLocal(() => qtys[p.id] = qty + 1); qtyCtrl.text = '${qty + 1}'; },
+                                          onTap: () { setLocal(() => qtys[t.key] = qty + 1); qtyCtrl.text = '${qty + 1}'; },
                                           borderRadius: const BorderRadius.horizontal(right: Radius.circular(6)),
                                           child: Container(width: 26, height: 28, alignment: Alignment.center,
                                             child: const Icon(Icons.add_rounded, size: 11, color: AppColors.textDark))),
                                       ]),
                                     ) else Padding(
                                       padding: const EdgeInsets.only(top: 2),
-                                      child: Text('${p.stock} in stock',
+                                      child: Text('${t.stock} in stock',
                                         style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted)),
                                     ),
                                   ]),
@@ -7198,9 +7225,9 @@ end tell
     ]),
   );
 
-  Future<void> _printAllBarcodesWithQty(List<Product> products, Map<String, int> qtys,
+  Future<void> _printAllBarcodesWithQty(List<_BarcodeTarget> targets, Map<String, int> qtys,
       {double labelW = 58, double labelH = 30, int labelsPerRow = 1, String? printerName}) async {
-    if (products.isEmpty) return;
+    if (targets.isEmpty) return;
 
     // Raw path: if a network label printer is configured, send TSPL/ZPL straight
     // to it over TCP:9100 — pixel-perfect, no driver, no preview needed.
@@ -7208,12 +7235,12 @@ end tell
     if (profile.isRaw) {
       final dest = profile.isUsb ? profile.queue : profile.host;
       final items = <LabelItem>[
-        for (final p in products)
+        for (final t in targets)
           LabelItem(
-            barcodeValue: p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku,
-            name: p.name,
-            price: '$_currencySymbol${p.price.toStringAsFixed(2)}',
-            count: qtys[p.id] ?? 1,
+            barcodeValue: t.barcodeValue,
+            name: t.name,
+            price: '$_currencySymbol${t.price.toStringAsFixed(2)}',
+            count: qtys[t.key] ?? 1,
           ),
       ];
       final spec = LabelSpec(labelWmm: labelW, labelHmm: labelH, columns: labelsPerRow, gapMm: 2.0);
@@ -7247,9 +7274,9 @@ end tell
 
     // Collect all labels across all products in order
     final allLabels = <pw.Widget>[];
-    for (final p in products) {
-      final count = qtys[p.id] ?? 1;
-      final barcodeVal = p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku;
+    for (final t in targets) {
+      final count = qtys[t.key] ?? 1;
+      final barcodeVal = t.barcodeValue;
       String svgStr;
       try {
         svgStr = bc.Barcode.ean13().toSvg(barcodeVal, width: 200, height: 80, drawText: false);
@@ -7262,8 +7289,8 @@ end tell
         padding: pw.EdgeInsets.symmetric(horizontal: innerPad, vertical: 1.5 * PdfPageFormat.mm),
         child: pw.Column(mainAxisAlignment: pw.MainAxisAlignment.center, children: [
           pw.SvgImage(svg: svgStr, width: (cellW - innerPad * 2), height: (cellH - 2 * PdfPageFormat.mm) * 0.62),
-          pw.Text(p.name, style: pw.TextStyle(font: bold, fontSize: 4.5, letterSpacing: 0.4), textAlign: pw.TextAlign.center),
-          pw.Text('$_currencySymbol${p.price.toStringAsFixed(2)}', style: pw.TextStyle(font: bold, fontSize: 4.5), textAlign: pw.TextAlign.center),
+          pw.Text(t.name, style: pw.TextStyle(font: bold, fontSize: 4.5, letterSpacing: 0.4), textAlign: pw.TextAlign.center),
+          pw.Text('$_currencySymbol${t.price.toStringAsFixed(2)}', style: pw.TextStyle(font: bold, fontSize: 4.5), textAlign: pw.TextAlign.center),
         ]),
       );
       for (int i = 0; i < count; i++) allLabels.add(labelCell());
@@ -13242,6 +13269,24 @@ class _BarcodePainter extends CustomPainter {
 }
 
 /// Editable draft of a product variant, backing the variants editor UI.
+/// One printable barcode label: a product, or a single variant of one.
+class _BarcodeTarget {
+  final String key; // product id, or 'productId::variantId'
+  final String name;
+  final String sku;
+  final String barcodeValue;
+  final int stock;
+  final double price;
+  const _BarcodeTarget({
+    required this.key,
+    required this.name,
+    required this.sku,
+    required this.barcodeValue,
+    required this.stock,
+    required this.price,
+  });
+}
+
 class _VariantDraft {
   final String id;
   final TextEditingController name;
