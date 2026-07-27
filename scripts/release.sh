@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+# Load saved release credentials (GITHUB_TOKEN, SUPABASE_SERVICE_KEY) from a
+# private file kept OUTSIDE the repo so it can never be committed. chmod 600.
+[ -f "$HOME/.billcat-release.env" ] && source "$HOME/.billcat-release.env"
+
 # ── Config ───────────────────────────────────────────────────────────────────
 SUPABASE_URL="https://xawpxbhglzhaibmcpwho.supabase.co"
 SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:?Set SUPABASE_SERVICE_KEY in your environment before running this script}"
