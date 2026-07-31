@@ -5800,6 +5800,134 @@ class _BillingScreenState extends State<BillingScreen> {
     if (mounted && _isPrinting) setState(() => _isPrinting = false);
   }
 
+  // ── CUPS printing — basic principle: resolve queue → raw bytes → verify ──
+  //
+  // Every thermal receipt printer speaks ESC/POS, so the one reliable
+  // pipeline for all makes is: find a queue that really exists, hand it the
+  // raw bytes (bypassing whatever driver the queue happens to have), then
+  // confirm the job left the queue — lpr exits 0 even when the printer is
+  // unplugged, so success must be verified, not assumed.
+
+  Future<List<String>> _cupsQueues() async {
+    try {
+      final res = await Process.run(
+        '/usr/bin/lpstat',
+        ['-e'],
+      ).timeout(const Duration(seconds: 5));
+      if (res.exitCode != 0) return const [];
+      return (res.stdout as String)
+          .split('\n')
+          .map((l) => l.trim())
+          .where((l) => l.isNotEmpty)
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// Resolves a printer's display name to its actual CUPS queue name.
+  /// CUPS mangles names beyond spaces→underscores (adds Printer_ prefixes,
+  /// numeric suffixes, drops hyphens), so a naive replaceAll can miss and
+  /// lpr then fails with "No such file or directory".
+  String? _matchQueue(String displayName, List<String> queues) {
+    String norm(String s) =>
+        s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+    final want = norm(displayName);
+    if (want.isEmpty) return null;
+    for (final q in queues) {
+      if (norm(q) == want) return q;
+    }
+    for (final q in queues) {
+      final nq = norm(q);
+      if (nq.isEmpty) continue;
+      if (nq.contains(want) || want.contains(nq)) return q;
+    }
+    return null;
+  }
+
+  /// Order of trust: the printer picked in settings, else the system
+  /// default, else whatever queue exists — a receipt on the wrong printer
+  /// beats no receipt at all on a busy counter.
+  Future<String?> _resolveQueue(String target) async {
+    final queues = await _cupsQueues();
+    if (queues.isEmpty) return null;
+    if (target != 'System Default' &&
+        target != 'PDF Export' &&
+        target.isNotEmpty) {
+      final q = _matchQueue(target, queues);
+      if (q != null) return q;
+    }
+    try {
+      final res = await Process.run(
+        '/usr/bin/lpstat',
+        ['-d'],
+      ).timeout(const Duration(seconds: 5));
+      final out = res.stdout as String;
+      final idx = out.indexOf(':');
+      if (idx > 0) {
+        final def = out.substring(idx + 1).trim();
+        if (queues.contains(def)) return def;
+      }
+    } catch (_) {}
+    return queues.first;
+  }
+
+  /// Prints [path] on [target]'s queue. Returns null on success, otherwise a
+  /// human-readable problem. [raw] bypasses the driver (ESC/POS receipts);
+  /// without it the file goes through the driver (PDF layouts).
+  Future<String?> _printViaCups(
+    String path,
+    String target, {
+    required bool raw,
+  }) async {
+    final queue = await _resolveQueue(target);
+    if (queue == null) {
+      return 'No printers are set up on this Mac (System Settings → Printers)';
+    }
+    final ProcessResult result;
+    try {
+      result = await Process.run(
+        '/usr/bin/lpr',
+        [if (raw) '-l', '-P', queue, path],
+      ).timeout(const Duration(seconds: 15));
+    } catch (e) {
+      return '$e';
+    }
+    if (result.exitCode != 0) {
+      final err = (result.stderr as String).trim();
+      return err.isEmpty ? 'lpr failed (exit ${result.exitCode})' : err;
+    }
+    // Accepted by CUPS is not the same as printed: a job for an unplugged
+    // printer queues forever with no error. Verify in the background so the
+    // counter isn't blocked. Raw receipts transfer in well under a second,
+    // so only they get the check — driver-rendered PDFs can legitimately
+    // take longer and would false-alarm.
+    if (raw) _warnIfQueueStuck(queue);
+    return null;
+  }
+
+  /// Fire-and-forget: if [queue] still holds jobs a few seconds after we
+  /// queued one, the printer is off or unplugged — surface that instead of
+  /// letting receipts pile up silently.
+  void _warnIfQueueStuck(String queue) {
+    Future(() async {
+      await Future.delayed(const Duration(seconds: 4));
+      try {
+        final check = await Process.run(
+          '/usr/bin/lpstat',
+          ['-o', queue],
+        ).timeout(const Duration(seconds: 5));
+        if ((check.stdout as String).trim().isNotEmpty && mounted) {
+          _showToast(
+            'Receipt sent to "$queue" but the printer is not responding — '
+            'check its power and USB cable',
+            isError: true,
+          );
+        }
+      } catch (_) {}
+    });
+  }
+
   Future<void> _printRecord(TransactionRecord tx, {String? paperSize, String docType = 'Invoice', bool toPrinter = false, String? printerNameOverride}) async {
     _clearPrintingState();
     if (!mounted) return;
@@ -5831,17 +5959,12 @@ class _BillingScreenState extends State<BillingScreen> {
         final escFile = File('/tmp/$receiptName.escpos');
         await escFile.writeAsBytes(bytes);
         final target = printerNameOverride ?? _selectedPrinter;
-        // Use lpr -l (literal/raw): sends bytes unfiltered, bypassing the CUPS
-        // driver — same effect as `lp -o raw`, but lpr is the binary that the
-        // macOS app can actually spawn (lp resolves to "No such file").
-        final args = <String>['-l'];
-        if (target != 'System Default' && target != 'PDF Export' && target.isNotEmpty) {
-          args.addAll(['-P', target.replaceAll(' ', '_')]);
-        }
-        args.add(escFile.path);
-        final result = await Process.run('/usr/bin/lpr', args);
-        if (result.exitCode != 0 && mounted) {
-          _showToast('Could not print: ${result.stderr}', isError: true);
+        // lpr -l (literal/raw): bytes go to the printer unfiltered — same
+        // effect as `lp -o raw`, but lpr is the binary that the macOS app
+        // can actually spawn (lp resolves to "No such file").
+        final problem = await _printViaCups(escFile.path, target, raw: true);
+        if (problem != null && mounted) {
+          _showToast('Could not print: $problem', isError: true);
         }
       } catch (e) {
         if (mounted) _showToast('Could not print: $e', isError: true);
@@ -5872,28 +5995,25 @@ class _BillingScreenState extends State<BillingScreen> {
 
       final pdfFile = File('/tmp/$receiptName.pdf');
       await pdfFile.writeAsBytes(pdfBytes);
-      final ProcessResult result;
       if (toPrinter) {
         // lpr sends directly to the selected printer silently — no UI opens.
         // printerNameOverride lets the Printer Settings "Print Test Page" target
         // the printer picked in the dialog before it has been saved.
         final target = printerNameOverride ?? _selectedPrinter;
-        final args = <String>[];
-        if (target != 'System Default' && target != 'PDF Export' && target.isNotEmpty) {
-          args.addAll(['-P', target.replaceAll(' ', '_')]);
+        final problem = await _printViaCups(pdfFile.path, target, raw: false);
+        if (problem != null && mounted) {
+          _showToast('Could not print: $problem', isError: true);
         }
-        args.add(pdfFile.path);
-        result = await Process.run('/usr/bin/lpr', args);
       } else {
-        result = await Process.run('/usr/bin/osascript',['-e',
+        final result = await Process.run('/usr/bin/osascript',['-e',
   'tell application "Preview" to activate\n'
   'tell application "Preview" to open POSIX file "${pdfFile.path}"\n'
   'delay 1\n'
   'tell application "System Events" to keystroke "p" using command down',
 ]);
-      }
-      if (result.exitCode != 0 && mounted) {
-        _showToast('Could not print: ${result.stderr}', isError: true);
+        if (result.exitCode != 0 && mounted) {
+          _showToast('Could not print: ${result.stderr}', isError: true);
+        }
       }
     } catch (e) {
       if (mounted) _showToast('Could not open PDF: $e', isError: true);
