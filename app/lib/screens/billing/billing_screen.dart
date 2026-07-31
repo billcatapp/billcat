@@ -5928,6 +5928,16 @@ class _BillingScreenState extends State<BillingScreen> {
     });
   }
 
+  /// Same short link the WhatsApp share uses — the receipt QR opens the
+  /// customer's digital invoice.
+  String _invoiceLinkFor(TransactionRecord tx) {
+    final invoiceNo = tx.id.replaceAll('-', '').substring(0, 6).toLowerCase();
+    final rawUid = Supabase.instance.client.auth.currentUser?.id ?? 'unknown';
+    final shortUid = rawUid.replaceAll('-', '').substring(0, 6).toLowerCase();
+    final branchPadded = _branchNumber.padLeft(2, '0');
+    return 'https://billcat.in/invoices/$shortUid$branchPadded$invoiceNo';
+  }
+
   Future<void> _printRecord(TransactionRecord tx, {String? paperSize, String docType = 'Invoice', bool toPrinter = false, String? printerNameOverride}) async {
     _clearPrintingState();
     if (!mounted) return;
@@ -5942,6 +5952,17 @@ class _BillingScreenState extends State<BillingScreen> {
     // native ESC/POS bytes straight to the queue with `lp -o raw`.
     if (toPrinter && isThermal) {
       try {
+        List<int>? logoRaster;
+        if (_logoPath.isNotEmpty) {
+          try {
+            final logoFile = File(_logoPath);
+            if (await logoFile.exists()) {
+              logoRaster = EscPosReceipt.rasterFromImageBytes(
+                await logoFile.readAsBytes(),
+              );
+            }
+          } catch (_) {} // fall back to the block mark
+        }
         final bytes = EscPosReceipt(
           cols: EscPosReceipt.colsForPaper(effectivePaper),
           cut: _thermalAutoCut,
@@ -5952,6 +5973,8 @@ class _BillingScreenState extends State<BillingScreen> {
           receiptFooter: _receiptFooter, taxLabel: _taxLabel,
           taxRate: _taxRateDisplay, currencySymbol: _currencySymbol,
           storeTerms: _storeTerms, docType: docType,
+          qrLink: _invoiceLinkFor(tx),
+          logoRaster: logoRaster,
         );
         final receiptName = tx.invoiceNumber != null
             ? 'Receipt-${tx.invoiceNumber}'

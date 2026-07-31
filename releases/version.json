@@ -1,8 +1,8 @@
 {
-  "version": "1.1.4",
-  "build": 49,
-  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.4/BillCat-1.1.4.zip",
-  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.4/BillCat-1.1.4.dmg",
-  "release_notes": "Reliable thermal printing: works with any receipt printer brand, automatically finds the right printer queue, and warns when the printer is off or unplugged",
+  "version": "1.1.5",
+  "build": 50,
+  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.5/BillCat-1.1.5.zip",
+  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.5/BillCat-1.1.5.dmg",
+  "release_notes": "New receipt design: your store logo printed on every receipt, QR code that opens the digital invoice, large store name, and a cleaner layout with bold grand total",
   "mandatory": false
 }
