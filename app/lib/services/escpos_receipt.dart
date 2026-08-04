@@ -254,12 +254,18 @@ class EscPosReceipt {
   static List<int>? rasterFromImageBytes(
     List<int> imageBytes, {
     int maxWidthDots = 240,
+    int maxHeightDots = 240,
   }) {
     final decoded = img.decodeImage(Uint8List.fromList(imageBytes));
     if (decoded == null) return null;
-    final im = decoded.width > maxWidthDots
-        ? img.copyResize(decoded, width: maxWidthDots)
-        : decoded;
+    // Fit inside maxWidth x maxHeight, keeping aspect ratio.
+    var im = decoded;
+    if (im.width > maxWidthDots) {
+      im = img.copyResize(im, width: maxWidthDots);
+    }
+    if (im.height > maxHeightDots) {
+      im = img.copyResize(im, height: maxHeightDots);
+    }
     final w = im.width, h = im.height;
     final wBytes = (w + 7) ~/ 8;
     final data = List<int>.filled(wBytes * h, 0);
@@ -277,12 +283,22 @@ class EscPosReceipt {
         }
       }
     }
-    return [
-      _gs, 0x76, 0x30, 0x00,
-      wBytes & 0xFF, (wBytes >> 8) & 0xFF,
-      h & 0xFF, (h >> 8) & 0xFF,
-      ...data,
-    ];
+    // Emit in bands of 32 rows, one GS v 0 command each. Budget POS-80
+    // clones have tiny raster buffers: a single large image command
+    // overflows them and the tail prints as text garbage. Small bands
+    // stack seamlessly and every ESC/POS printer digests them.
+    const bandRows = 32;
+    final out = <int>[];
+    for (var y0 = 0; y0 < h; y0 += bandRows) {
+      final bh = (h - y0) < bandRows ? (h - y0) : bandRows;
+      out.addAll([
+        _gs, 0x76, 0x30, 0x00,
+        wBytes & 0xFF, (wBytes >> 8) & 0xFF,
+        bh & 0xFF, (bh >> 8) & 0xFF,
+      ]);
+      out.addAll(data.sublist(y0 * wBytes, (y0 + bh) * wBytes));
+    }
+    return out;
   }
 
   /// ESC/POS model-2 QR code, module size 5, error correction M.

@@ -1,8 +1,8 @@
 {
-  "version": "1.1.5",
-  "build": 50,
-  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.5/BillCat-1.1.5.zip",
-  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.5/BillCat-1.1.5.dmg",
-  "release_notes": "New receipt design: your store logo printed on every receipt, QR code that opens the digital invoice, large store name, and a cleaner layout with bold grand total",
+  "version": "1.1.6",
+  "build": 51,
+  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.6/BillCat-1.1.6.zip",
+  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.6/BillCat-1.1.6.dmg",
+  "release_notes": "Barcode label overhaul: EAN-13 barcodes auto-sized and centered on every sticker, multi-column label rolls with gaps supported, printer gap calibration, and clear errors when the printer is off. Receipt logo now prints correctly on all printer models.",
   "mandatory": false
 }

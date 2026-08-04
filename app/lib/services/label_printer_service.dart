@@ -210,19 +210,57 @@ class LabelPrinterService {
     return out;
   }
 
+  /// True for values printable as native EAN-13 (the app's generated
+  /// product barcodes): exactly 12 or 13 digits. EAN-13 has a FIXED width
+  /// of 95 modules, so its printed size is exact — never estimated.
+  static bool _isEan13(String value) => RegExp(r'^\d{12,13}$').hasMatch(value);
+
+  static const int _ean13Modules = 95;
+
+  /// Approximate printed width of a Code 128 barcode in dots. Conservative
+  /// per-character estimate — printer firmwares differ in how they pack
+  /// digits, so never assume subset-C compression.
+  static int _code128Dots(String value, int narrow) =>
+      (11 * value.length + 35) * narrow;
+
+  /// Largest narrow-module width (3 → 2 → 1) whose barcode fits [availDots]:
+  /// the boldest bars the sticker allows. 1 dot (0.125mm at 203dpi) is the
+  /// readable minimum for direct thermal.
+  static int _fitNarrow(String value, int availDots) {
+    for (var n = 3; n > 1; n--) {
+      if (_code128Dots(value, n) <= availDots) return n;
+    }
+    return 1;
+  }
+
   static String buildTspl(List<LabelItem> items, LabelSpec spec, int dpi) {
     final flat = _flatten(items);
     final b = StringBuffer();
-    final fullW = spec.fullWidthMm.toStringAsFixed(1);
+    // Stickers sit side by side with the same gap BETWEEN columns as between
+    // rows: the column pitch must include it, or every sticker off-center
+    // drifts a little more (only the middle one looks aligned).
+    final fullW =
+        (spec.labelWmm * spec.columns + spec.gapMm * (spec.columns - 1))
+            .toStringAsFixed(1);
     final labelH = spec.labelHmm.toStringAsFixed(1);
     final gap = spec.gapMm.toStringAsFixed(1);
 
     final colWDots = _dots(spec.labelWmm, dpi);
-    final padX = _dots(2.0, dpi); // inner left padding per label
-    final barH = _dots(spec.labelHmm * 0.5, dpi).clamp(20, 100000);
-    final yBar = _dots(1.5, dpi);
-    final yName = yBar + barH + _dots(1.0, dpi);
-    final yPrice = yName + (dpi ~/ 12) + 14;
+    final colPitch = _dots(spec.labelWmm + spec.gapMm, dpi);
+    final margin = _dots(2.0, dpi); // quiet zone kept clear on BOTH sides
+    final availW = colWDots - margin * 2;
+    final barH = _dots(spec.labelHmm * 0.55, dpi).clamp(20, 100000);
+    // Center the whole block (barcode + two text lines) vertically so the
+    // top and bottom margins match — "placed perfect" on every sticker.
+    final labelHDots = _dots(spec.labelHmm, dpi);
+    final lineGap = _dots(1.0, dpi);
+    final priceDrop = (dpi ~/ 12) + 14;
+    const textH = 24; // TSPL font "1" line height incl. breathing room
+    final contentH = barH + lineGap + priceDrop + textH;
+    final yBar = ((labelHDots - contentH) ~/ 2).clamp(_dots(1.0, dpi), labelHDots);
+    final yName = yBar + barH + lineGap;
+    final yPrice = yName + priceDrop;
+    const charW = 8; // TSPL font "1" character width in dots
 
     b.writeln('SIZE $fullW mm,$labelH mm');
     b.writeln('GAP $gap mm,0 mm');
@@ -234,33 +272,75 @@ class LabelPrinterService {
       final end = (start + spec.columns).clamp(0, flat.length);
       for (var i = start; i < end; i++) {
         final it = flat[i];
-        final col = i - start;
-        final x = col * colWDots + padX;
+        final colStart = (i - start) * colPitch;
         final val = _clean(it.barcodeValue);
         if (val.isEmpty) continue;
-        // BARCODE x,y,"type",height,human,rotation,narrow,wide,"content"
-        b.writeln('BARCODE $x,$yBar,"128",$barH,0,0,2,2,"$val"');
-        final name = _clean(it.name);
-        final price = _clean(it.price);
-        if (name.isNotEmpty) b.writeln('TEXT $x,$yName,"1",0,1,1,"$name"');
-        if (price.isNotEmpty) b.writeln('TEXT $x,$yPrice,"1",0,1,1,"$price"');
+        // Auto-fit: pick the boldest bars that keep the barcode inside its
+        // own sticker, then center it — bars must never cross a neighbour.
+        // EAN-13 values use the native type: exactly 95 modules wide, so
+        // the printed width is known, not estimated.
+        if (_isEan13(val)) {
+          final v12 = val.substring(0, 12); // printer computes check digit
+          var narrow = 3;
+          while (narrow > 1 && _ean13Modules * narrow > availW) narrow--;
+          final barW = _ean13Modules * narrow;
+          final xBar =
+              colStart + ((colWDots - barW) ~/ 2).clamp(margin, colWDots);
+          b.writeln(
+              'BARCODE $xBar,$yBar,"EAN13",$barH,0,0,$narrow,$narrow,"$v12"');
+        } else {
+          final narrow = _fitNarrow(val, availW);
+          final barW = _code128Dots(val, narrow);
+          final xBar =
+              colStart + ((colWDots - barW) ~/ 2).clamp(margin, colWDots);
+          // BARCODE x,y,"type",height,human,rotation,narrow,wide,"content"
+          b.writeln(
+              'BARCODE $xBar,$yBar,"128",$barH,0,0,$narrow,$narrow,"$val"');
+        }
+        final maxChars = availW ~/ charW;
+        final name = _truncate(_clean(it.name), maxChars);
+        final price = _truncate(_clean(it.price), maxChars);
+        if (name.isNotEmpty) {
+          final xn = colStart +
+              ((colWDots - name.length * charW) ~/ 2).clamp(margin, colWDots);
+          b.writeln('TEXT $xn,$yName,"1",0,1,1,"$name"');
+        }
+        if (price.isNotEmpty) {
+          final xp = colStart +
+              ((colWDots - price.length * charW) ~/ 2).clamp(margin, colWDots);
+          b.writeln('TEXT $xp,$yPrice,"1",0,1,1,"$price"');
+        }
       }
       b.writeln('PRINT 1,1');
     }
     return b.toString();
   }
 
+  static String _truncate(String s, int max) =>
+      s.length <= max ? s : s.substring(0, max < 0 ? 0 : max);
+
   static String buildZpl(List<LabelItem> items, LabelSpec spec, int dpi) {
     final flat = _flatten(items);
     final b = StringBuffer();
-    final fullWDots = _dots(spec.fullWidthMm, dpi);
+    final fullWDots = _dots(
+        spec.labelWmm * spec.columns + spec.gapMm * (spec.columns - 1), dpi);
     final labelHDots = _dots(spec.labelHmm, dpi);
     final colWDots = _dots(spec.labelWmm, dpi);
+    final colPitch = _dots(spec.labelWmm + spec.gapMm, dpi);
     final padX = _dots(2.0, dpi);
-    final barH = _dots(spec.labelHmm * 0.5, dpi).clamp(20, 100000);
-    final yBar = _dots(1.5, dpi);
-    final yName = yBar + barH + _dots(1.0, dpi);
+    final barH = _dots(spec.labelHmm * 0.55, dpi).clamp(20, 100000);
+    // Vertically centered content block, matching the TSPL builder.
+    final lineGap = _dots(1.0, dpi);
+    const zplTextH = 22;
+    final contentH = barH + lineGap + 22 + zplTextH;
+    final yBar =
+        ((labelHDots - contentH) ~/ 2).clamp(_dots(1.0, dpi), labelHDots);
+    final yName = yBar + barH + lineGap;
     final yPrice = yName + 22;
+
+    final margin = padX;
+    final availW = colWDots - margin * 2;
+    const zplCharW = 10; // ^A0N,18,18 approx character width in dots
 
     for (var start = 0; start < flat.length; start += spec.columns) {
       b.writeln('^XA');
@@ -269,15 +349,37 @@ class LabelPrinterService {
       final end = (start + spec.columns).clamp(0, flat.length);
       for (var i = start; i < end; i++) {
         final it = flat[i];
-        final col = i - start;
-        final x = col * colWDots + padX;
+        final colStart = (i - start) * colPitch;
         final val = _clean(it.barcodeValue);
         if (val.isEmpty) continue;
-        b.writeln('^FO$x,$yBar^BY2^BCN,$barH,N,N,N^FD$val^FS');
-        final name = _clean(it.name);
-        final price = _clean(it.price);
-        if (name.isNotEmpty) b.writeln('^FO$x,$yName^A0N,18,18^FD$name^FS');
-        if (price.isNotEmpty) b.writeln('^FO$x,$yPrice^A0N,18,18^FD$price^FS');
+        if (_isEan13(val)) {
+          final v12 = val.substring(0, 12); // printer computes check digit
+          var narrow = 3;
+          while (narrow > 1 && _ean13Modules * narrow > availW) narrow--;
+          final barW = _ean13Modules * narrow;
+          final xBar =
+              colStart + ((colWDots - barW) ~/ 2).clamp(margin, colWDots);
+          b.writeln('^FO$xBar,$yBar^BY$narrow^BEN,$barH,N,N^FD$v12^FS');
+        } else {
+          final narrow = _fitNarrow(val, availW);
+          final barW = _code128Dots(val, narrow);
+          final xBar =
+              colStart + ((colWDots - barW) ~/ 2).clamp(margin, colWDots);
+          b.writeln('^FO$xBar,$yBar^BY$narrow^BCN,$barH,N,N,N^FD$val^FS');
+        }
+        final maxChars = availW ~/ zplCharW;
+        final name = _truncate(_clean(it.name), maxChars);
+        final price = _truncate(_clean(it.price), maxChars);
+        if (name.isNotEmpty) {
+          final xn = colStart +
+              ((colWDots - name.length * zplCharW) ~/ 2).clamp(margin, colWDots);
+          b.writeln('^FO$xn,$yName^A0N,18,18^FD$name^FS');
+        }
+        if (price.isNotEmpty) {
+          final xp = colStart +
+              ((colWDots - price.length * zplCharW) ~/ 2).clamp(margin, colWDots);
+          b.writeln('^FO$xp,$yPrice^A0N,18,18^FD$price^FS');
+        }
       }
       b.writeln('^XZ');
     }
@@ -290,35 +392,89 @@ class LabelPrinterService {
           : buildTspl(items, spec, p.dpi);
 
   // ── Transport ───────────────────────────────────────────────────────────
-  /// Sends raw bytes to a network printer over TCP. Throws on failure so the
-  /// caller can surface the error and fall back to PDF.
+  /// Sends raw bytes to a network printer over TCP. One automatic retry on a
+  /// transient failure; hard timeout so a wedged printer can't hang the UI.
+  /// Throws on failure so the caller can surface the error.
   static Future<void> sendRawNetwork(String data, LabelPrinterProfile p) async {
-    final socket = await Socket.connect(
-      p.host.trim(),
-      p.port,
-      timeout: const Duration(seconds: 6),
-    );
+    Future<void> attempt() async {
+      final socket = await Socket.connect(
+        p.host.trim(),
+        p.port,
+        timeout: const Duration(seconds: 6),
+      );
+      try {
+        socket.add(latin1.encode(data));
+        await socket.flush().timeout(const Duration(seconds: 10));
+      } finally {
+        await socket.close();
+        socket.destroy();
+      }
+    }
+
     try {
-      socket.add(latin1.encode(data));
-      await socket.flush();
-    } finally {
-      await socket.close();
-      socket.destroy();
+      await attempt();
+    } catch (_) {
+      await Future.delayed(const Duration(milliseconds: 600));
+      await attempt(); // second failure propagates to the caller
     }
   }
 
-  /// Sends raw bytes to a USB printer via its CUPS queue using `lp -o raw`,
-  /// which bypasses the queue's driver/PPD and delivers the bytes untouched.
+  /// Resolves a saved printer/queue name to the CUPS queue that actually
+  /// exists. CUPS mangles names (prefixes, suffixes, dropped punctuation),
+  /// so match ignoring case and non-alphanumerics; fall back to the saved
+  /// string so an exact name still works even if lpstat is unavailable.
+  static Future<String> _resolveQueue(String saved) async {
+    final queues = await listQueues();
+    if (queues.isEmpty) return saved;
+    String norm(String s) =>
+        s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+    final want = norm(saved);
+    if (want.isEmpty) return saved;
+    for (final q in queues) {
+      if (norm(q) == want) return q;
+    }
+    for (final q in queues) {
+      final nq = norm(q);
+      if (nq.isEmpty) continue;
+      if (nq.contains(want) || want.contains(nq)) return q;
+    }
+    return saved;
+  }
+
+  /// Sends raw bytes to a USB printer via its CUPS queue using `lpr -l`
+  /// (literal/raw), which bypasses the queue's driver/PPD and delivers the
+  /// bytes untouched. lpr, not lp: lp fails to spawn from the packaged app
+  /// (same finding as receipt printing). After queueing, verifies the
+  /// printer actually took the job — lpr exits 0 even when the printer is
+  /// off, and a silently stuck queue is worse than an error.
   static Future<void> sendRawUsb(String data, String queue) async {
+    final resolved = await _resolveQueue(queue.trim());
     final tmp = await Directory.systemTemp.createTemp('billcat_lbl_');
     final f = File('${tmp.path}/label.prn');
     await f.writeAsString(data, encoding: latin1, flush: true);
-    final res = await Process.run('/usr/bin/lp', ['-d', queue, '-o', 'raw', f.path]);
+    final res = await Process.run('/usr/bin/lpr', ['-l', '-P', resolved, f.path])
+        .timeout(const Duration(seconds: 15));
     try { await tmp.delete(recursive: true); } catch (_) {}
     if (res.exitCode != 0) {
       throw Exception((res.stderr as String?)?.trim().isNotEmpty == true
           ? (res.stderr as String).trim()
-          : 'lp exited with code ${res.exitCode}');
+          : 'lpr exited with code ${res.exitCode}');
+    }
+    // Queued is not printed: give the transfer a moment, then check the
+    // queue drained. Label jobs are tiny, so a lingering job means the
+    // printer is off/unplugged (the job stays queued and prints later).
+    await Future.delayed(const Duration(seconds: 3));
+    try {
+      final check = await Process.run('/usr/bin/lpstat', ['-o', resolved])
+          .timeout(const Duration(seconds: 5));
+      if ('${check.stdout}'.trim().isNotEmpty) {
+        throw Exception(
+            'printer "$resolved" is not responding — check its power and USB '
+            'cable (the label stays queued and will print when it reconnects)');
+      }
+    } on Exception catch (e) {
+      if (e.toString().contains('not responding')) rethrow;
+      // lpstat itself failing is not proof of a print failure — let it pass.
     }
   }
 
@@ -346,6 +502,53 @@ class LabelPrinterService {
       await sendRawUsb(data, profile.queue.trim());
     } else {
       await sendRawNetwork(data, profile);
+    }
+  }
+
+  /// Sends the printer's own gap-calibration command so it re-learns the
+  /// label size and gap from the loaded roll. Run after changing label stock
+  /// — fixes the "printing drifts off the sticker" class of problems.
+  static Future<void> calibrate(LabelPrinterProfile profile) async {
+    final cmd = profile.language == LabelLanguage.zpl
+        ? '~JC\n'
+        : 'GAPDETECT\n';
+    if (profile.transport == LabelTransport.usb) {
+      await sendRawUsb(cmd, profile.queue.trim());
+    } else {
+      await sendRawNetwork(cmd, profile);
+    }
+  }
+
+  /// Prints one probe label in EACH language, regardless of the configured
+  /// one. Only the language the printer really speaks produces a scannable
+  /// barcode (whose content is that language's code), so scanning whichever
+  /// label printed cleanly identifies the right setting — the "select
+  /// language by scanning" setup flow.
+  static Future<void> printLanguageProbes(
+    LabelSpec spec,
+    LabelPrinterProfile profile,
+  ) async {
+    final single = LabelSpec(
+      labelWmm: spec.labelWmm,
+      labelHmm: spec.labelHmm,
+      columns: 1,
+      gapMm: spec.gapMm,
+    );
+    for (final lang in LabelLanguage.values) {
+      final item = LabelItem(
+        barcodeValue: lang.code.toUpperCase(),
+        name: 'BillCat printer setup',
+        price: 'Scan this barcode',
+        count: 1,
+      );
+      final data = lang == LabelLanguage.zpl
+          ? buildZpl([item], single, profile.dpi)
+          : buildTspl([item], single, profile.dpi);
+      if (profile.transport == LabelTransport.usb) {
+        await sendRawUsb(data, profile.queue.trim());
+      } else {
+        await sendRawNetwork(data, profile);
+      }
     }
   }
 
