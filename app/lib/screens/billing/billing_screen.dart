@@ -135,6 +135,32 @@ const List<_Currency> _currencies = [
   (flag: '🇵🇬', code: 'PGK', name: 'Papua New Guinea Kina',   symbol: 'K'),
 ];
 
+/// The one true bill number shown anywhere in the app: the invoice number
+/// assigned at checkout when there is one, otherwise a short slice of the
+/// transaction id. Receipts, reports, dialogs and searches must all use
+/// this so a customer's printed number always matches what staff see.
+String billNo(TransactionRecord t) =>
+    (t.invoiceNumber?.isNotEmpty == true)
+        ? t.invoiceNumber!
+        : t.id.substring(0, 6).toUpperCase();
+
+/// Money with Indian-style comma grouping: 1234567.5 → "₹12,34,567.50".
+/// Top-level so the product/cart card widgets can use it too.
+String fmtMoney(String symbol, double v, {int decimals = 2}) {
+  final neg = v < 0;
+  final parts = v.abs().toStringAsFixed(decimals).split('.');
+  var intPart = parts[0];
+  if (intPart.length > 3) {
+    final last3 = intPart.substring(intPart.length - 3);
+    final rest = intPart.substring(0, intPart.length - 3);
+    final grouped = rest.replaceAllMapped(
+        RegExp(r'(\d)(?=(\d{2})+$)'), (m) => '${m[1]},');
+    intPart = '$grouped,$last3';
+  }
+  final dec = parts.length > 1 ? '.${parts[1]}' : '';
+  return '${neg ? '-' : ''}$symbol$intPart$dec';
+}
+
 class BillingScreen extends StatefulWidget {
   const BillingScreen({super.key});
   @override
@@ -155,7 +181,14 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // Reports state
   String _reportView    = 'Sales';
-  String _utilitiesView = 'Delivery';
+  String _utilitiesView = 'Quotation';
+
+  // ── Quotation screen state ──────────────────────────────────────────────
+  final List<_QuoteLine> _quoteLines = [];
+  final TextEditingController _quoteCustomerCtrl = TextEditingController();
+  final TextEditingController _quotePhoneCtrl = TextEditingController();
+  bool _quoteApplyTax = true;
+  String? _quoteNumber;
   String _salesSearchQuery = '';
   String _customerSearchQuery = '';
   bool _showCreditOnly = false;
@@ -621,14 +654,25 @@ class _BillingScreenState extends State<BillingScreen> {
     final catMap          = {for (final p in products) p.id: p.category};
     final buyingPriceMap  = {for (final p in products) p.id: p.buyingPrice};
 
+    // Refund/exchange documents adjust revenue (their totals are negative),
+    // but they are not additional *sales*: counting them inflated the
+    // transaction count and dragged average order value down, and their
+    // negative lines could push Items Sold below zero.
+    bool isReturnDoc(TransactionRecord t) =>
+        t.paymentMethod.toLowerCase() == 'refund' ||
+        t.paymentMethod.toLowerCase().startsWith('exchange-') ||
+        (t.invoiceNumber ?? '').startsWith('R-');
+
     double sales = 0, ySales = 0;
-    int txCount = todayTx.length, yTxCount = yesterdayTx.length;
+    int txCount = todayTx.where((t) => !isReturnDoc(t)).length,
+        yTxCount = yesterdayTx.where((t) => !isReturnDoc(t)).length;
     int items = 0, yItems = 0;
     final catRevenue = <String, double>{};
 
     for (final t in todayTx) {
       sales += t.total;
       for (final i in t.items) {
+        // Returned units reduce the count; exchange units still count as sold.
         items += i.quantity;
         final cat = catMap[i.productId] ?? 'Other';
         catRevenue[cat] = (catRevenue[cat] ?? 0) + i.total;
@@ -774,6 +818,11 @@ class _BillingScreenState extends State<BillingScreen> {
     _searchFocus.dispose();
     _customerNameCtrl.dispose();
     _customerPhoneCtrl.dispose();
+    for (final l in _quoteLines) {
+      l.dispose();
+    }
+    _quoteCustomerCtrl.dispose();
+    _quotePhoneCtrl.dispose();
     _customerNameFocus.dispose();
     _customerPhoneFocus.dispose();
     _addCustomerFocus.dispose();
@@ -1109,6 +1158,30 @@ class _BillingScreenState extends State<BillingScreen> {
               ),
             ),
           ],
+          if (_selectedTab == 1) ...[
+            const SizedBox(width: 8),
+            GestureDetector(
+              onTap: _showReturnExchangeDialog,
+              child: Container(
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                decoration: BoxDecoration(
+                  color: AppColors.accentBlue,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.assignment_return_outlined,
+                      color: Colors.white, size: 15),
+                  const SizedBox(width: 7),
+                  Text('Return/Exchange',
+                      style: GoogleFonts.inter(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white)),
+                ]),
+              ),
+            ),
+          ],
           if (_selectedTab != 2) ...[
             const SizedBox(width: 8),
             _topBarIconBtn(Icons.print_outlined, 'Printer', _showPrinterDialog),
@@ -1120,6 +1193,1055 @@ class _BillingScreenState extends State<BillingScreen> {
           _buildProfileMenu(),
         ],
       ),
+    );
+  }
+
+  // ── Return / Exchange ─────────────────────────────────────────────────────
+  //
+  // A return is recorded as a NEW transaction linked to the original by
+  // invoice number ("R-<original>"): returned items carry negative
+  // quantities (with the original bill's discount baked into their unit
+  // price), exchange items are normal positive lines. Reports therefore
+  // deduct refunds naturally, and insertReturnTransaction puts returned
+  // stock back. No schema changes anywhere.
+
+  /// Status chips for a bill: PAID/CREDIT plus RETURNED/EXCHANGED when a
+  /// linked return exists. Returns are matched by their "R-<bill>" invoice
+  /// number; a return that also contains positive-quantity lines was an
+  /// exchange.
+  List<(String, Color)> _billBadges(
+      List<TransactionRecord> all, TransactionRecord t) {
+    final out = <(String, Color)>[];
+    final method = t.paymentMethod.toLowerCase();
+    // The row IS a return document: label it by what it did.
+    if (method == 'refund' ||
+        method.startsWith('exchange-') ||
+        (t.invoiceNumber ?? '').startsWith('R-')) {
+      final hasExchange = t.items.any((i) => i.quantity > 0);
+      out.add(hasExchange
+          ? ('EXCHANGE', const Color(0xFF2563EB))
+          : ('REFUND', const Color(0xFFDC2626)));
+      return out;
+    }
+    if (method.contains('credit')) {
+      out.add(('CREDIT', const Color(0xFFD97706)));
+    } else {
+      out.add(('PAID', const Color(0xFF16A34A)));
+    }
+    final retInv = 'r-${_billNumber(t)}'.toLowerCase();
+    var returned = false, exchanged = false;
+    for (final r in all) {
+      if ((r.invoiceNumber ?? '').toLowerCase() != retInv) continue;
+      returned = true;
+      if (r.items.any((i) => i.quantity > 0)) exchanged = true;
+    }
+    if (exchanged) out.add(('EXCHANGED', const Color(0xFF2563EB)));
+    if (returned && !exchanged) out.add(('RETURNED', const Color(0xFFDC2626)));
+    return out;
+  }
+
+  /// Small pill used by [_billBadges].
+  Widget _badgeChip(String label, Color color) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: color.withValues(alpha: 0.35)),
+        ),
+        child: Text(label,
+            style: GoogleFonts.inter(
+                fontSize: 9, fontWeight: FontWeight.w800, color: color)),
+      );
+
+  /// Indian-style comma grouping: 1234567.5 → "12,34,567.50".
+  String _inr(double v) {
+    final neg = v < 0;
+    final parts = v.abs().toStringAsFixed(2).split('.');
+    var intPart = parts[0];
+    String grouped;
+    if (intPart.length <= 3) {
+      grouped = intPart;
+    } else {
+      final last3 = intPart.substring(intPart.length - 3);
+      var rest = intPart.substring(0, intPart.length - 3);
+      final buf = <String>[];
+      while (rest.length > 2) {
+        buf.insert(0, rest.substring(rest.length - 2));
+        rest = rest.substring(0, rest.length - 2);
+      }
+      if (rest.isNotEmpty) buf.insert(0, rest);
+      grouped = '${buf.join(',')},$last3';
+    }
+    return '${neg ? '-' : ''}$grouped.${parts[1]}';
+  }
+
+  /// Display number a bill is known by (matches what receipts print).
+  String _billNumber(TransactionRecord t) => billNo(t);
+
+  /// Quantity of [item] already returned against [original] in [all].
+  int _alreadyReturned(List<TransactionRecord> all, TransactionRecord original,
+      TransactionItem item) {
+    final retInv = 'R-${_billNumber(original)}'.toLowerCase();
+    var n = 0;
+    for (final t in all) {
+      if ((t.invoiceNumber ?? '').toLowerCase() != retInv) continue;
+      for (final it in t.items) {
+        if (it.quantity >= 0) continue;
+        // Products are identified by id; two different products can share a
+        // name, and matching on name alone made them block each other.
+        final sameLine = item.productId.isNotEmpty
+            ? (it.productId == item.productId &&
+                it.variantId == item.variantId)
+            : (it.productName == item.productName &&
+                it.variantId == item.variantId);
+        if (sameLine) n += -it.quantity;
+      }
+    }
+    return n;
+  }
+
+  Future<void> _showReturnExchangeDialog() async {
+    final all = await LocalDbService.getTransactions();
+    if (!mounted) return;
+    final searchCtrl = TextEditingController();
+    final scanCtrl = TextEditingController();
+    final custNameCtrl = TextEditingController();
+    final custPhoneCtrl = TextEditingController();
+    final scanFocus = FocusNode();
+    double creditSettled = 0;
+    var topUpMethod = 'cash'; // how a COLLECT difference was paid
+    TransactionRecord? bill;
+    String? error;
+    final returnQty = <int, int>{}; // item index in bill -> qty coming back
+    final exchange = <_QuoteLine>[]; // replacement items (name locked)
+    bool saving = false;
+
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) {
+        // ── money math ──
+        final b = bill;
+        double refund = 0, refundTax = 0;
+        if (b != null) {
+          final discountFactor =
+              b.subtotal > 0 ? 1 - (b.discountAmount / b.subtotal) : 1.0;
+          final taxRate = b.subtotal - b.discountAmount > 0
+              ? b.taxAmount / (b.subtotal - b.discountAmount)
+              : 0.0;
+          for (var i = 0; i < b.items.length; i++) {
+            final qty = returnQty[i] ?? 0;
+            if (qty == 0) continue;
+            final net = b.items[i].price * discountFactor * qty;
+            refund += net;
+            refundTax += net * taxRate;
+          }
+        }
+        final currentRate = (double.tryParse(_taxRateDisplay) ?? 0) / 100;
+        double exchangeVal = 0;
+        for (final l in exchange) {
+          exchangeVal += l.total;
+        }
+        final exchangeTax = exchangeVal * currentRate;
+        final net = (exchangeVal + exchangeTax) - (refund + refundTax);
+        final anyReturn = returnQty.values.any((v) => v > 0);
+        final canConfirm = b != null && (anyReturn || exchange.isNotEmpty);
+
+        Future<void> confirm({required String action}) async {
+          if (b == null || saving) return;
+          setLocal(() => saving = true);
+          final discountFactor =
+              b.subtotal > 0 ? 1 - (b.discountAmount / b.subtotal) : 1.0;
+          final items = <TransactionItem>[];
+          for (var i = 0; i < b.items.length; i++) {
+            final qty = returnQty[i] ?? 0;
+            if (qty == 0) continue;
+            final src = b.items[i];
+            items.add(TransactionItem(
+              productId: src.productId,
+              productName: src.productName,
+              // Keep the exact discounted unit price: rounding it here and
+              // then multiplying by qty drifted from the total shown on
+              // screen (up to a rupee on large lines).
+              price: src.price * discountFactor,
+              quantity: -qty,
+              variantId: src.variantId,
+            ));
+          }
+          for (final l in exchange) {
+            if (l.qty <= 0) continue;
+            items.add(TransactionItem(
+              productId: l.productId ?? '',
+              productName: l.name.text.trim(),
+              price: l.priceValue,
+              quantity: l.qty,
+              variantId: l.variantIdRef,
+            ));
+          }
+          final subtotal = items.fold(0.0, (s, i) => s + i.price * i.quantity);
+          final tax = exchangeTax - refundTax;
+          final tx = TransactionRecord(
+            id: const Uuid().v4(),
+            invoiceNumber: 'R-${_billNumber(b)}',
+            customerName: custNameCtrl.text.trim().isEmpty
+                ? b.customerName
+                : custNameCtrl.text.trim(),
+            customerPhone: custPhoneCtrl.text.trim().isEmpty
+                ? b.customerPhone
+                : custPhoneCtrl.text.trim(),
+            items: items,
+            subtotal: double.parse(subtotal.toStringAsFixed(2)),
+            discountAmount: 0,
+            taxAmount: double.parse(tax.toStringAsFixed(2)),
+            total: double.parse((subtotal + tax).toStringAsFixed(2)),
+            // 'refund' when money goes out; a collected top-up is a sale of
+            // the difference, so it carries the method it was paid with.
+            paymentMethod: net > 0 ? 'exchange-$topUpMethod' : 'refund',
+            createdAt: DateTime.now(),
+          );
+          try {
+            await LocalDbService.insertReturnTransaction(tx);
+            // If this customer owes money (udhaar), a refund should clear the
+            // due first instead of paying cash out over an unpaid balance.
+            final phone = (custPhoneCtrl.text.trim().isNotEmpty
+                    ? custPhoneCtrl.text.trim()
+                    : b.customerPhone) ??
+                '';
+            if (net < 0 && phone.isNotEmpty) {
+              final owed = await LocalDbService.creditBalanceForPhone(phone);
+              if (owed > 0) {
+                final settle = owed < -net ? owed : -net;
+                await LocalDbService.addCreditToCustomer(phone, -settle);
+                creditSettled = settle;
+              }
+            }
+          } catch (e) {
+            // Never leave the dialog stuck on "Saving...": re-enable the
+            // buttons and tell the operator, so the return can be retried.
+            setLocal(() {
+              saving = false;
+              error = 'Could not save this return: $e';
+            });
+            return;
+          }
+          ConnectivityService.instance.syncNow();
+          if (ctx.mounted) Navigator.pop(ctx);
+          _loadProducts();
+          _loadDashboardData();
+          _showToast(net < 0
+              ? (creditSettled > 0
+                  ? 'Return recorded — $_currencySymbol${_inr(creditSettled)} '
+                      'settled against dues, pay '
+                      '$_currencySymbol${_inr(-net - creditSettled)}'
+                  : 'Return recorded — refund $_currencySymbol${_inr(-net)}')
+              : 'Exchange recorded — collect $_currencySymbol${net.toStringAsFixed(2)}');
+          if (action == 'close') return; // recorded only, no document
+          if (action == 'print') {
+            await _printRecord(tx, docType: 'Return', toPrinter: true);
+          } else {
+            // E-BILL: share the return note as a PDF (WhatsApp/Mail/AirDrop).
+            try {
+              final bytes = await ReceiptPrinter.buildPdf(
+                tx,
+                storeName: _storeName, storeAddress: _storeAddress,
+                storePhone: _storePhone, storeEmail: _storeEmail,
+                storeGstin: _storeGstin, receiptFooter: _receiptFooter,
+                taxLabel: _taxLabel, taxRate: _taxRateDisplay,
+                currencySymbol: _currencySymbol, paperSize: _paperSize,
+                orientation: _printOrientation, layout: _invoiceLayout,
+                storeTerms: _storeTerms, logoPath: _logoPath,
+                storeUpiId: _storeUpiId, docType: 'Return',
+              );
+              await Printing.sharePdf(
+                  bytes: bytes,
+                  filename: 'Return-${tx.invoiceNumber ?? 'note'}.pdf');
+            } catch (e) {
+              if (mounted) {
+                _showToast('Could not create e-bill: $e', isError: true);
+              }
+            }
+          }
+        }
+
+        void addExchange(Product p, ProductVariant? v) {
+          final avail = v?.stock ?? p.stock;
+          if (avail <= 0) {
+            _showToast('${v == null ? p.name : '${p.name} · ${v.name}'} is out '
+                'of stock — exchange recorded anyway', isError: true);
+          }
+          setLocal(() => exchange.add(_QuoteLine(
+                initialName: v == null ? p.name : '${p.name} · ${v.name}',
+                initialPrice: (v?.price ?? p.price).toStringAsFixed(2),
+              )
+                ..productId = p.id
+                ..variantIdRef = v?.id));
+        }
+
+        // Barcode scanners type the code and press Enter — exact barcode
+        // match adds instantly; a unique name match adds too; anything
+        // ambiguous opens the picker pre-filtered by hand.
+        void scanAdd(String raw) {
+          final s = raw.trim().toLowerCase();
+          scanCtrl.clear();
+          if (s.isEmpty) return;
+          for (final p in _products) {
+            if (p.barcodeNo.toLowerCase() == s) {
+              // Variant products carry stock/price per variant: adding the
+              // base product would price it wrongly and move the wrong stock.
+              if (p.variants.isNotEmpty) {
+                _pickProductForReturn(ctx, addExchange);
+                return;
+              }
+              addExchange(p, null);
+              return;
+            }
+            for (final v in p.variants) {
+              if (v.barcodeNo.toLowerCase() == s) {
+                addExchange(p, v);
+                return;
+              }
+            }
+          }
+          final byName = _products
+              .where((p) => p.name.toLowerCase().contains(s))
+              .toList();
+          if (byName.length == 1 && byName.first.variants.isEmpty) {
+            addExchange(byName.first, null);
+            return;
+          }
+          _pickProductForReturn(ctx, addExchange);
+        }
+
+        return Dialog(
+          backgroundColor: Colors.white,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          child: SizedBox(
+            width: 560,
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    const Icon(Icons.assignment_return_outlined,
+                        size: 20, color: AppColors.primary),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                          b == null
+                              ? 'Return / Exchange'
+                              : 'Return / Exchange — #${_billNumber(b)}',
+                          overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.manrope(
+                              fontSize: 17, fontWeight: FontWeight.w800)),
+                    ),
+                    if (b != null)
+                      TextButton(
+                        onPressed: () => setLocal(() {
+                          bill = null;
+                          returnQty.clear();
+                        }),
+                        child: Text('Change bill',
+                            style: GoogleFonts.inter(fontSize: 12)),
+                      ),
+                    IconButton(
+                        icon: const Icon(Icons.close, size: 18),
+                        onPressed: () => Navigator.pop(ctx)),
+                  ]),
+                  const SizedBox(height: 12),
+                  // ── bill picker: search or browse recent bills ──
+                  if (b == null) ...[
+                    TextField(
+                      controller: searchCtrl,
+                      autofocus: true,
+                      style: GoogleFonts.inter(fontSize: 13),
+                      onChanged: (_) => setLocal(() {}),
+                      decoration: InputDecoration(
+                        hintText: 'Search invoice, customer, phone or item...',
+                        prefixIcon: const Icon(Icons.search, size: 18),
+                        isDense: true,
+                        border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10)),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Builder(builder: (_) {
+                      final q = searchCtrl.text
+                          .trim()
+                          .replaceAll('#', '')
+                          .toLowerCase();
+                      // Every document is listed — sales plus the return /
+                      // exchange records themselves — so the history is
+                      // complete. Tapping a return jumps to the bill it came
+                      // from.
+                      final sales = all.where((t) {
+                        if (q.isEmpty) return true;
+                        if ((t.invoiceNumber ?? '')
+                            .toLowerCase()
+                            .contains(q)) {
+                          return true;
+                        }
+                        if (t.id
+                            .replaceAll('-', '')
+                            .toLowerCase()
+                            .startsWith(q)) {
+                          return true;
+                        }
+                        if ((t.customerName ?? '')
+                            .toLowerCase()
+                            .contains(q)) {
+                          return true;
+                        }
+                        if ((t.customerPhone ?? '').contains(q)) return true;
+                        return t.items.any((i) =>
+                            i.productName.toLowerCase().contains(q));
+                      }).take(30).toList();
+                      if (sales.isEmpty) {
+                        return Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Text('No matching bills',
+                              style: GoogleFonts.inter(
+                                  fontSize: 13, color: AppColors.textMuted)),
+                        );
+                      }
+                      return ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 340),
+                        child: ListView.builder(
+                          shrinkWrap: true,
+                          itemCount: sales.length,
+                          itemBuilder: (_, i) {
+                            final t = sales[i];
+                            return InkWell(
+                              onTap: () {
+                                final inv = t.invoiceNumber ?? '';
+                                // A pure refund can't be returned again, so
+                                // it redirects to its original bill. An
+                                // EXCHANGE document handed goods to the
+                                // customer, so it must be openable itself.
+                                final hasOutgoing =
+                                    t.items.any((i) => i.quantity > 0);
+                                final isReturnDoc = !hasOutgoing &&
+                                    (t.paymentMethod.toLowerCase() == 'refund' ||
+                                        inv.startsWith('R-'));
+                                // A return document can't itself be returned:
+                                // open the original bill it was raised against.
+                                TransactionRecord? target = t;
+                                if (isReturnDoc) {
+                                  final origNo =
+                                      inv.replaceFirst('R-', '').toLowerCase();
+                                  target = null;
+                                  for (final o in all) {
+                                    if (billNo(o).toLowerCase() == origNo) {
+                                      target = o;
+                                      break;
+                                    }
+                                  }
+                                  if (target == null) {
+                                    _showToast(
+                                        'Original bill for this return is not '
+                                        'on this device',
+                                        isError: true);
+                                    return;
+                                  }
+                                }
+                                setLocal(() {
+                                  bill = target;
+                                  returnQty.clear();
+                                  // Exchange lines belong to the bill they
+                                  // were added against — never carry them
+                                  // onto a different customer's bill.
+                                  for (final l in exchange) {
+                                    final d = l;
+                                    Future.delayed(
+                                        const Duration(milliseconds: 400),
+                                        d.dispose);
+                                  }
+                                  exchange.clear();
+                                  scanCtrl.clear();
+                                  error = null;
+                                  custNameCtrl.text = target!.customerName ?? '';
+                                  custPhoneCtrl.text = target.customerPhone ?? '';
+                                });
+                              },
+                              borderRadius: BorderRadius.circular(10),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 8, vertical: 9),
+                                child: Row(children: [
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text('#${_billNumber(t)}',
+                                            style: GoogleFonts.inter(
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w700)),
+                                        Text(
+                                            '${_fmtDate(t.createdAt)} · ${t.items.length} item${t.items.length == 1 ? '' : 's'}'
+                                            '${(t.customerName ?? '').isNotEmpty ? ' · ${t.customerName}' : ''}',
+                                            style: GoogleFonts.inter(
+                                                fontSize: 11,
+                                                color: AppColors.textMuted)),
+                                        const SizedBox(height: 4),
+                                        Wrap(
+                                          spacing: 5,
+                                          runSpacing: 4,
+                                          children: [
+                                            for (final badge
+                                                in _billBadges(all, t))
+                                              _badgeChip(badge.$1, badge.$2),
+                                          ],
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  Text(
+                                      '$_currencySymbol${_inr(t.total)}',
+                                      style: GoogleFonts.inter(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: t.total < 0
+                                              ? const Color(0xFFDC2626)
+                                              : AppColors.textDark)),
+                                  const SizedBox(width: 4),
+                                  const Icon(Icons.chevron_right_rounded,
+                                      size: 16, color: AppColors.textMuted),
+                                ]),
+                              ),
+                            );
+                          },
+                        ),
+                      );
+                    }),
+                  ],
+                  if (error != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Text(error!,
+                          style: GoogleFonts.inter(
+                              fontSize: 12, color: Colors.red)),
+                    ),
+                  if (b != null) ...[
+                    const SizedBox(height: 14),
+                    Text('Bill #${_billNumber(b)} · ${_fmtDate(b.createdAt)}',
+                        style: GoogleFonts.inter(
+                            fontSize: 12, color: AppColors.textMuted)),
+                    const SizedBox(height: 10),
+                    // Customer details — prefilled from the bill, editable
+                    // (walk-in sales often have no name on the original).
+                    Row(children: [
+                      Expanded(
+                        child: TextField(
+                          controller: custNameCtrl,
+                          style: GoogleFonts.inter(fontSize: 13),
+                          decoration: InputDecoration(
+                            hintText: 'Customer name',
+                            prefixIcon:
+                                const Icon(Icons.person_outline, size: 16),
+                            isDense: true,
+                            border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(10)),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      SizedBox(
+                        width: 190,
+                        child: TextField(
+                          controller: custPhoneCtrl,
+                          style: GoogleFonts.inter(fontSize: 13),
+                          decoration: InputDecoration(
+                            hintText: 'Phone',
+                            prefixIcon:
+                                const Icon(Icons.phone_outlined, size: 16),
+                            isDense: true,
+                            border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(10)),
+                          ),
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 16),
+                    // ── returned items ──
+                    Text('ITEMS ON THIS BILL',
+                        style: GoogleFonts.inter(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 1.2,
+                            color: AppColors.textMuted)),
+                    const SizedBox(height: 8),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 230),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          children: [
+                            for (var i = 0; i < b.items.length; i++)
+                              Builder(builder: (_) {
+                                final it = b.items[i];
+                                final maxQty = it.quantity -
+                                    _alreadyReturned(all, b, it);
+                                final sel = returnQty[i] ?? 0;
+                                return Container(
+                                  margin: const EdgeInsets.only(bottom: 6),
+                                  padding: const EdgeInsets.fromLTRB(
+                                      12, 8, 8, 8),
+                                  decoration: BoxDecoration(
+                                    color: sel > 0
+                                        ? const Color(0xFFFEF2F2)
+                                        : AppColors.surface,
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(
+                                        color: sel > 0
+                                            ? const Color(0xFFFECACA)
+                                            : AppColors.border),
+                                  ),
+                                  child: Row(children: [
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(it.productName,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: GoogleFonts.inter(
+                                                  fontSize: 13,
+                                                  fontWeight:
+                                                      FontWeight.w600)),
+                                          const SizedBox(height: 2),
+                                          Text(
+                                              '${fmtMoney(_currencySymbol, it.price)} × ${it.quantity}',
+                                              style: GoogleFonts.inter(
+                                                  fontSize: 11,
+                                                  color:
+                                                      AppColors.textMuted)),
+                                        ],
+                                      ),
+                                    ),
+                                    if (maxQty <= 0)
+                                      Text('already returned',
+                                          style: GoogleFonts.inter(
+                                              fontSize: 11,
+                                              color: AppColors.textMuted))
+                                    else ...[
+                                      if (sel > 0) ...[
+                                        IconButton(
+                                          icon: const Icon(
+                                              Icons.remove_circle_outline,
+                                              size: 16),
+                                          color: Colors.red,
+                                          onPressed: () => setLocal(
+                                              () => returnQty[i] = sel - 1),
+                                        ),
+                                        Text('$sel/$maxQty',
+                                            style: GoogleFonts.inter(
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w800,
+                                                color: Colors.red)),
+                                        const SizedBox(width: 6),
+                                      ],
+                                      OutlinedButton(
+                                        onPressed: sel < maxQty
+                                            ? () => setLocal(() =>
+                                                returnQty[i] = sel + 1)
+                                            : null,
+                                        style: OutlinedButton.styleFrom(
+                                          visualDensity:
+                                              VisualDensity.compact,
+                                          side: const BorderSide(
+                                              color: AppColors.border),
+                                        ),
+                                        child: Text('RETURN',
+                                            style: GoogleFonts.inter(
+                                                fontSize: 10,
+                                                fontWeight:
+                                                    FontWeight.w800)),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      OutlinedButton(
+                                        // Marks the item as coming back and
+                                        // jumps to the scan box so the
+                                        // replacement can be scanned straight
+                                        // away — no extra popup.
+                                        onPressed: sel < maxQty
+                                            ? () {
+                                                setLocal(() =>
+                                                    returnQty[i] = sel + 1);
+                                                scanFocus.requestFocus();
+                                              }
+                                            : null,
+                                        style: OutlinedButton.styleFrom(
+                                          visualDensity:
+                                              VisualDensity.compact,
+                                          side: const BorderSide(
+                                              color: AppColors.border),
+                                        ),
+                                        child: Text('EXCHANGE',
+                                            style: GoogleFonts.inter(
+                                                fontSize: 10,
+                                                fontWeight:
+                                                    FontWeight.w800)),
+                                      ),
+                                    ],
+                                  ]),
+                                );
+                              }),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    Text('EXCHANGE WITH',
+                        style: GoogleFonts.inter(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 1.2,
+                            color: AppColors.textMuted)),
+                    const SizedBox(height: 8),
+                    // ── exchange items: scan or search to add ──
+                    TextField(
+                      controller: scanCtrl,
+                      focusNode: scanFocus,
+                      onSubmitted: scanAdd,
+                      style: GoogleFonts.inter(fontSize: 13),
+                      decoration: InputDecoration(
+                        hintText: 'Scan barcode or search a product to add...',
+                        prefixIcon:
+                            const Icon(Icons.qr_code_scanner, size: 18),
+                        suffixIcon: IconButton(
+                          icon: const Icon(Icons.add, size: 18),
+                          tooltip: 'Browse products',
+                          onPressed: () =>
+                              _pickProductForReturn(ctx, addExchange),
+                        ),
+                        isDense: true,
+                        border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10)),
+                      ),
+                    ),
+                    for (var i = 0; i < exchange.length; i++)
+                      Container(
+                        margin: const EdgeInsets.only(top: 6),
+                        padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFEFF6FF),
+                          borderRadius: BorderRadius.circular(10),
+                          border:
+                              Border.all(color: const Color(0xFFBFDBFE)),
+                        ),
+                        child: Row(children: [
+                        Expanded(
+                            child: Text(exchange[i].name.text,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600))),
+                        IconButton(
+                          icon: const Icon(Icons.remove_circle_outline,
+                              size: 18),
+                          onPressed: exchange[i].qty > 1
+                              ? () => setLocal(() => exchange[i].qty--)
+                              : null,
+                        ),
+                        Text('${exchange[i].qty}',
+                            style: GoogleFonts.inter(
+                                fontSize: 13, fontWeight: FontWeight.w700)),
+                        IconButton(
+                          icon:
+                              const Icon(Icons.add_circle_outline, size: 18),
+                          onPressed: () => setLocal(() => exchange[i].qty++),
+                        ),
+                        SizedBox(
+                          width: 80,
+                          child: Text(
+                              '$_currencySymbol${_inr(exchange[i].total)}',
+                              textAlign: TextAlign.right,
+                              style: GoogleFonts.inter(fontSize: 13)),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close, size: 15),
+                          onPressed: () => setLocal(() {
+                            final l = exchange.removeAt(i);
+                            Future.delayed(
+                                const Duration(milliseconds: 400), l.dispose);
+                          }),
+                        ),
+                      ])),
+                    const SizedBox(height: 14),
+                    // ── summary ──
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: AppColors.surface,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Column(children: [
+                    Row(children: [
+                      Text('OLD BILL AMOUNT',
+                          style: GoogleFonts.inter(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                              color: AppColors.textMuted)),
+                      const Spacer(),
+                      Text('$_currencySymbol${_inr(b.total)}',
+                          style: GoogleFonts.inter(
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                    ]),
+                    if (anyReturn)
+                      Row(children: [
+                        Text('RETURNING NOW',
+                            style: GoogleFonts.inter(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.textMuted)),
+                        const Spacer(),
+                        Text(
+                            '-$_currencySymbol${_inr(refund + refundTax)}',
+                            style: GoogleFonts.inter(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.red)),
+                      ]),
+                    if (exchange.isNotEmpty)
+                      Row(children: [
+                        Text('NEW ITEMS',
+                            style: GoogleFonts.inter(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.textMuted)),
+                        const Spacer(),
+                        Text(
+                            '$_currencySymbol${_inr(exchangeVal + exchangeTax)}',
+                            style: GoogleFonts.inter(
+                                fontSize: 13, fontWeight: FontWeight.w600)),
+                      ]),
+                    const SizedBox(height: 6),
+                    Row(children: [
+                      Text(
+                          net < 0
+                              ? 'REFUND TO CUSTOMER'
+                              : 'COLLECT FROM CUSTOMER',
+                          style: GoogleFonts.manrope(
+                              fontSize: 13, fontWeight: FontWeight.w800)),
+                      const Spacer(),
+                      Text(
+                          '$_currencySymbol${_inr(net.abs())}',
+                          style: GoogleFonts.manrope(
+                              fontSize: 17, fontWeight: FontWeight.w800,
+                              color: net < 0
+                                  ? Colors.red
+                                  : AppColors.primary)),
+                    ]),
+                    ]),
+                    ),
+                    if (net > 0) ...[
+                      const SizedBox(height: 10),
+                      Row(children: [
+                        Text('PAID BY',
+                            style: GoogleFonts.inter(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: 1.2,
+                                color: AppColors.textMuted)),
+                        const SizedBox(width: 10),
+                        for (final m in const ['cash', 'card', 'upi'])
+                          Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: ChoiceChip(
+                              label: Text(m.toUpperCase(),
+                                  style: GoogleFonts.inter(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700)),
+                              selected: topUpMethod == m,
+                              onSelected: (_) =>
+                                  setLocal(() => topUpMethod = m),
+                            ),
+                          ),
+                      ]),
+                    ],
+                    const SizedBox(height: 14),
+                    Row(children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: canConfirm && !saving
+                              ? () => confirm(action: 'print')
+                              : null,
+                          icon: const Icon(Icons.print_outlined, size: 16),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: AppColors.primary,
+                            foregroundColor: Colors.white,
+                            elevation: 0,
+                            padding:
+                                const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10)),
+                          ),
+                          label: Text(saving ? 'Saving...' : 'PRINT RECEIPT',
+                              style: GoogleFonts.inter(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w800)),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: canConfirm && !saving
+                              ? () => confirm(action: 'ebill')
+                              : null,
+                          icon: const Icon(Icons.ios_share_outlined,
+                              size: 16),
+                          style: OutlinedButton.styleFrom(
+                            side: const BorderSide(color: AppColors.border),
+                            padding:
+                                const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10)),
+                          ),
+                          label: Text('E-BILL',
+                              style: GoogleFonts.inter(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w800,
+                                  color: AppColors.textDark)),
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: canConfirm && !saving
+                            ? () => confirm(action: 'close')
+                            : null,
+                        icon: const Icon(Icons.check_circle_outline, size: 17),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF16A34A),
+                          foregroundColor: Colors.white,
+                          elevation: 0,
+                          padding: const EdgeInsets.symmetric(vertical: 15),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10)),
+                        ),
+                        label: Text('CLOSE BILL',
+                            style: GoogleFonts.inter(
+                                fontSize: 13, fontWeight: FontWeight.w800)),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+    // The dialog route keeps animating out briefly after the future
+    // resolves — disposing controllers immediately crashes that last frame.
+    await Future.delayed(const Duration(milliseconds: 400));
+    searchCtrl.dispose();
+    scanCtrl.dispose();
+    custNameCtrl.dispose();
+    custPhoneCtrl.dispose();
+    scanFocus.dispose();
+    for (final l in exchange) {
+      l.dispose();
+    }
+  }
+
+  /// Product (and variant) picker for the exchange list.
+  void _pickProductForReturn(BuildContext parentCtx,
+      void Function(Product, ProductVariant?) onPick) {
+    if (_products.isEmpty) {
+      _showToast('No products in inventory to exchange with', isError: true);
+      return;
+    }
+    String query = '';
+    // useRootNavigator: false keeps this picker inside the same navigator as
+    // the Return/Exchange dialog it opens from, so it reliably appears above
+    // it instead of being swallowed by the root route.
+    showDialog(
+      context: parentCtx,
+      useRootNavigator: false,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) {
+        final list = _products
+            .where(
+                (p) => p.name.toLowerCase().contains(query.toLowerCase()))
+            .toList();
+        return Dialog(
+          backgroundColor: Colors.white,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: SizedBox(
+            width: 420,
+            height: 460,
+            child: Column(children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: TextField(
+                  autofocus: true,
+                  onChanged: (v) => setLocal(() => query = v),
+                  decoration: InputDecoration(
+                    hintText: 'Search products...',
+                    prefixIcon: const Icon(Icons.search, size: 18),
+                    isDense: true,
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10)),
+                  ),
+                ),
+              ),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: list.length,
+                  itemBuilder: (_, i) {
+                    final p = list[i];
+                    final variants = p.variants;
+                    if (variants.isEmpty) {
+                      return ListTile(
+                        dense: true,
+                        title: Text(p.name,
+                            style: GoogleFonts.inter(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600)),
+                        trailing: Text(
+                            fmtMoney(_currencySymbol, p.price),
+                            style: GoogleFonts.inter(fontSize: 13)),
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          onPick(p, null);
+                        },
+                      );
+                    }
+                    return ExpansionTile(
+                      dense: true,
+                      title: Text(p.name,
+                          style: GoogleFonts.inter(
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                      children: [
+                        for (final v in variants)
+                          ListTile(
+                            dense: true,
+                            title: Text(v.name,
+                                style: GoogleFonts.inter(fontSize: 12)),
+                            trailing: Text(
+                                fmtMoney(_currencySymbol, v.price),
+                                style: GoogleFonts.inter(fontSize: 12)),
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              onPick(p, v);
+                            },
+                          ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+            ]),
+          ),
+        );
+      }),
     );
   }
 
@@ -1204,15 +2326,15 @@ class _BillingScreenState extends State<BillingScreen> {
         });
       },
       itemBuilder: (_) => [
-        'Delivery',
+        'Quotation',
       ].map((v) => PopupMenuItem<String>(
         value: v,
         height: 40,
         child: Row(children: [
           Icon(
             switch (v) {
-              'Delivery' => Icons.local_shipping_outlined,
-              _          => Icons.build_outlined,
+              'Quotation' => Icons.request_quote_outlined,
+              _           => Icons.build_outlined,
             },
             size: 16,
             color: (selected && _utilitiesView == v) ? AppColors.accentBlue : AppColors.textMuted,
@@ -5978,7 +7100,7 @@ class _BillingScreenState extends State<BillingScreen> {
         );
         final receiptName = tx.invoiceNumber != null
             ? 'Receipt-${tx.invoiceNumber}'
-            : 'Receipt-${tx.id.substring(0, 6).toUpperCase()}';
+            : 'Receipt-${billNo(tx)}';
         final escFile = File('/tmp/$receiptName.escpos');
         await escFile.writeAsBytes(bytes);
         final target = printerNameOverride ?? _selectedPrinter;
@@ -6014,7 +7136,7 @@ class _BillingScreenState extends State<BillingScreen> {
 
       final receiptName = tx.invoiceNumber != null
           ? 'Receipt-${tx.invoiceNumber}'
-          : 'Receipt-${tx.id.substring(0, 6).toUpperCase()}';
+          : 'Receipt-${billNo(tx)}';
 
       final pdfFile = File('/tmp/$receiptName.pdf');
       await pdfFile.writeAsBytes(pdfBytes);
@@ -6258,7 +7380,7 @@ class _BillingScreenState extends State<BillingScreen> {
       if (!folder.existsSync()) folder.createSync(recursive: true);
       final receiptName = tx.invoiceNumber != null
           ? 'Receipt-${tx.invoiceNumber}'
-          : 'Receipt-${tx.id.substring(0, 6).toUpperCase()}';
+          : 'Receipt-${billNo(tx)}';
       await File('${folder.path}/$receiptName.pdf').writeAsBytes(pdfBytes);
     } catch (_) {}
   }
@@ -6269,7 +7391,7 @@ class _BillingScreenState extends State<BillingScreen> {
 
   String _buildReceiptHtml(TransactionRecord tx, {String docType = 'Invoice'}) {
     final sym = _currencySymbol;
-    final invoiceNo = _esc(tx.invoiceNumber ?? tx.id.substring(0, 6).toUpperCase());
+    final invoiceNo = _esc(billNo(tx));
     final date = tx.createdAt;
     final dateStr = '${date.day}/${date.month}/${date.year}';
     final timeStr = '${date.hour.toString().padLeft(2,'0')}:${date.minute.toString().padLeft(2,'0')}';
@@ -9975,7 +11097,10 @@ end tell
 
   // Indian comma format: 1,00,000.00
   String _fmtComma(double v) {
-    final parts = v.toStringAsFixed(2).split('.');
+    // Returns/refunds are negative — keep the sign outside the grouping,
+    // otherwise "-500" groups into "-,500".
+    final neg = v < 0;
+    final parts = v.abs().toStringAsFixed(2).split('.');
     String intPart = parts[0];
     if (intPart.length > 3) {
       final last3 = intPart.substring(intPart.length - 3);
@@ -9983,7 +11108,7 @@ end tell
       final grouped = rest.replaceAllMapped(RegExp(r'(\d)(?=(\d{2})+$)'), (m) => '${m[1]},');
       intPart = '$grouped,$last3';
     }
-    return '$_currencySymbol$intPart.${parts[1]}';
+    return '${neg ? '-' : ''}$_currencySymbol$intPart.${parts[1]}';
   }
 
   Widget _buildBarChart(List<(String, double)> bars) =>
@@ -10447,7 +11572,7 @@ end tell
             ),
             ...rows.map((t) => pw.TableRow(children: [
               _pdfCell(t.createdAt.toString().substring(0, 16), regular),
-              _pdfCell('#${t.invoiceNumber ?? t.id.substring(0, 6).toUpperCase()}', regular),
+              _pdfCell('#${billNo(t)}', regular),
               _pdfCell(t.customerName ?? '—', regular),
               _pdfCell(t.paymentMethod, regular),
               _pdfCell('$_currencySymbol${t.total.toStringAsFixed(2)}', bold),
@@ -10611,36 +11736,467 @@ end tell
           Text('May ${DateTime.now().day}, ${DateTime.now().year}',
               style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted)),
           const SizedBox(height: 24),
-          if (_utilitiesView == 'Delivery') _buildDeliveryView(),
+          if (_utilitiesView == 'Quotation') _buildQuotationView(),
         ],
       ),
     );
   }
 
-  Widget _buildDeliveryView() {
-    return Expanded(
-      child: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-              width: 72, height: 72,
-              decoration: BoxDecoration(
-                color: AppColors.accentBlue.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(20),
+  // Quotations are print/share-only documents: they never touch the sales
+  // tables or stock, so everything here builds a throwaway TransactionRecord
+  // and hands it to the existing (approved) print/PDF pipeline as docType
+  // 'Quotation'.
+
+  double get _quoteSubtotal =>
+      _quoteLines.fold(0.0, (s, l) => s + l.total);
+
+  double get _quoteTaxAmount {
+    if (!_quoteApplyTax) return 0;
+    final rate = double.tryParse(_taxRateDisplay) ?? 0;
+    return _quoteSubtotal * rate / 100;
+  }
+
+  List<_QuoteLine> get _validQuoteLines => _quoteLines
+      .where((l) => l.name.text.trim().isNotEmpty && l.priceValue > 0)
+      .toList();
+
+  TransactionRecord _quoteTx() {
+    _quoteNumber ??=
+        'QTN-${DateTime.now().millisecondsSinceEpoch.toRadixString(36).toUpperCase()}';
+    final items = _validQuoteLines
+        .map((l) => TransactionItem(
+              productId: '',
+              productName: l.name.text.trim(),
+              price: l.priceValue,
+              quantity: l.qty,
+            ))
+        .toList();
+    return TransactionRecord(
+      id: const Uuid().v4(),
+      invoiceNumber: _quoteNumber,
+      customerName: _quoteCustomerCtrl.text.trim().isEmpty
+          ? null
+          : _quoteCustomerCtrl.text.trim(),
+      customerPhone: _quotePhoneCtrl.text.trim().isEmpty
+          ? null
+          : _quotePhoneCtrl.text.trim(),
+      items: items,
+      subtotal: _quoteSubtotal,
+      discountAmount: 0,
+      taxAmount: _quoteTaxAmount,
+      total: _quoteSubtotal + _quoteTaxAmount,
+      paymentMethod: 'Quotation',
+      createdAt: DateTime.now(),
+    );
+  }
+
+  Future<Uint8List> _quotePdfBytes() => ReceiptPrinter.buildPdf(
+        _quoteTx(),
+        storeName: _storeName, storeAddress: _storeAddress,
+        storePhone: _storePhone, storeEmail: _storeEmail,
+        storeGstin: _storeGstin, receiptFooter: _receiptFooter,
+        taxLabel: _taxLabel,
+        taxRate: _quoteApplyTax ? _taxRateDisplay : '0',
+        currencySymbol: _currencySymbol, paperSize: _paperSize,
+        orientation: _printOrientation, layout: _invoiceLayout,
+        storeTerms: _storeTerms, logoPath: _logoPath,
+        storeUpiId: _storeUpiId, docType: 'Quotation',
+      );
+
+  Future<void> _printQuotation() async {
+    if (_validQuoteLines.isEmpty) {
+      _showToast('Add at least one item with a price', isError: true);
+      return;
+    }
+    await _printRecord(_quoteTx(), docType: 'Quotation', toPrinter: true);
+  }
+
+  Future<void> _saveQuotationPdf() async {
+    if (_validQuoteLines.isEmpty) {
+      _showToast('Add at least one item with a price', isError: true);
+      return;
+    }
+    try {
+      final bytes = await _quotePdfBytes();
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save Quotation PDF',
+        fileName: '${_quoteNumber ?? 'Quotation'}.pdf',
+        type: FileType.custom,
+        allowedExtensions: ['pdf'],
+      );
+      if (path == null) return;
+      final target = path.toLowerCase().endsWith('.pdf') ? path : '$path.pdf';
+      await File(target).writeAsBytes(bytes);
+      if (mounted) _showToast('Quotation saved');
+    } catch (e) {
+      if (mounted) _showToast('Could not save PDF: $e', isError: true);
+    }
+  }
+
+  Future<void> _shareQuotation() async {
+    if (_validQuoteLines.isEmpty) {
+      _showToast('Add at least one item with a price', isError: true);
+      return;
+    }
+    try {
+      final bytes = await _quotePdfBytes();
+      await Printing.sharePdf(
+        bytes: bytes,
+        filename: '${_quoteNumber ?? 'Quotation'}.pdf',
+      );
+    } catch (e) {
+      if (mounted) _showToast('Could not share: $e', isError: true);
+    }
+  }
+
+  void _clearQuotation() {
+    setState(() {
+      for (final l in _quoteLines) {
+        l.dispose();
+      }
+      _quoteLines.clear();
+      _quoteCustomerCtrl.clear();
+      _quotePhoneCtrl.clear();
+      _quoteNumber = null;
+    });
+  }
+
+  void _addQuoteLineFromProducts() {
+    String query = '';
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) {
+        final list = _products
+            .where((p) =>
+                p.name.toLowerCase().contains(query.toLowerCase()))
+            .toList();
+        return Dialog(
+          backgroundColor: Colors.white,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: SizedBox(
+            width: 420,
+            height: 480,
+            child: Column(children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: TextField(
+                  autofocus: true,
+                  onChanged: (v) => setLocal(() => query = v),
+                  decoration: InputDecoration(
+                    hintText: 'Search products...',
+                    prefixIcon: const Icon(Icons.search, size: 18),
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10)),
+                    isDense: true,
+                  ),
+                ),
               ),
-              child: const Icon(Icons.local_shipping_outlined,
-                  size: 36, color: AppColors.accentBlue),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: list.length,
+                  itemBuilder: (_, i) {
+                    final p = list[i];
+                    return ListTile(
+                      dense: true,
+                      title: Text(p.name,
+                          style: GoogleFonts.inter(
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                      trailing: Text(
+                          '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                          style: GoogleFonts.inter(fontSize: 13)),
+                      onTap: () {
+                        setState(() => _quoteLines.add(_QuoteLine(
+                              initialName: p.name,
+                              initialPrice: p.price.toStringAsFixed(2),
+                            )));
+                        Navigator.pop(ctx);
+                      },
+                    );
+                  },
+                ),
+              ),
+            ]),
+          ),
+        );
+      }),
+    );
+  }
+
+  Widget _quoteLineRow(int i) {
+    final l = _quoteLines[i];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(children: [
+        Expanded(
+          flex: 5,
+          child: TextField(
+            controller: l.name,
+            onChanged: (_) => setState(() {}),
+            style: GoogleFonts.inter(fontSize: 13),
+            decoration: InputDecoration(
+              hintText: 'Item name',
+              isDense: true,
+              border:
+                  OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
             ),
-            const SizedBox(height: 16),
-            Text('Delivery', style: GoogleFonts.manrope(
-                fontSize: 18, fontWeight: FontWeight.w700, color: AppColors.textDark)),
-            const SizedBox(height: 8),
-            Text('Delivery management coming soon.',
-                style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted)),
-          ],
+          ),
         ),
-      ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 120,
+          child: TextField(
+            controller: l.price,
+            onChanged: (_) => setState(() {}),
+            keyboardType:
+                const TextInputType.numberWithOptions(decimal: true),
+            style: GoogleFonts.inter(fontSize: 13),
+            decoration: InputDecoration(
+              hintText: '0.00',
+              prefixText: _currencySymbol,
+              isDense: true,
+              border:
+                  OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        IconButton(
+          icon: const Icon(Icons.remove_circle_outline, size: 18),
+          color: AppColors.textMuted,
+          onPressed: l.qty > 1 ? () => setState(() => l.qty--) : null,
+        ),
+        SizedBox(
+            width: 24,
+            child: Center(
+                child: Text('${l.qty}',
+                    style: GoogleFonts.inter(
+                        fontSize: 13, fontWeight: FontWeight.w700)))),
+        IconButton(
+          icon: const Icon(Icons.add_circle_outline, size: 18),
+          color: AppColors.textMuted,
+          onPressed: () => setState(() => l.qty++),
+        ),
+        SizedBox(
+          width: 84,
+          child: Text(
+            '$_currencySymbol${l.total.toStringAsFixed(2)}',
+            textAlign: TextAlign.right,
+            style:
+                GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600),
+          ),
+        ),
+        IconButton(
+          icon: const Icon(Icons.close, size: 16),
+          color: AppColors.textMuted,
+          onPressed: () => setState(() {
+            final l = _quoteLines.removeAt(i);
+            Future.delayed(const Duration(milliseconds: 400), l.dispose);
+          }),
+        ),
+      ]),
+    );
+  }
+
+  Widget _quoteActionButton(String label, IconData icon, VoidCallback onTap,
+      {bool filled = false}) {
+    return SizedBox(
+      width: double.infinity,
+      child: filled
+          ? ElevatedButton.icon(
+              onPressed: onTap,
+              icon: Icon(icon, size: 16),
+              label: Text(label,
+                  style: GoogleFonts.inter(
+                      fontSize: 13, fontWeight: FontWeight.w600)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10)),
+              ),
+            )
+          : OutlinedButton.icon(
+              onPressed: onTap,
+              icon: Icon(icon, size: 16, color: AppColors.textDark),
+              label: Text(label,
+                  style: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.textDark)),
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: AppColors.border),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10)),
+              ),
+            ),
+    );
+  }
+
+  Widget _buildQuotationView() {
+    return Expanded(
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // ── Items editor ──
+        Expanded(
+          child: Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _quoteCustomerCtrl,
+                        style: GoogleFonts.inter(fontSize: 13),
+                        decoration: InputDecoration(
+                          hintText: 'Customer name',
+                          prefixIcon: const Icon(Icons.person_outline, size: 16),
+                          isDense: true,
+                          border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    SizedBox(
+                      width: 190,
+                      child: TextField(
+                        controller: _quotePhoneCtrl,
+                        style: GoogleFonts.inter(fontSize: 13),
+                        decoration: InputDecoration(
+                          hintText: 'Phone',
+                          prefixIcon: const Icon(Icons.phone_outlined, size: 16),
+                          isDense: true,
+                          border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10)),
+                        ),
+                      ),
+                    ),
+                  ]),
+                  const SizedBox(height: 16),
+                  Expanded(
+                    child: _quoteLines.isEmpty
+                        ? Center(
+                            child: Text(
+                                'No items yet — type one below or pick from your products.',
+                                style: GoogleFonts.inter(
+                                    fontSize: 13, color: AppColors.textMuted)))
+                        : ListView.builder(
+                            itemCount: _quoteLines.length,
+                            itemBuilder: (_, i) => _quoteLineRow(i),
+                          ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    OutlinedButton.icon(
+                      onPressed: () =>
+                          setState(() => _quoteLines.add(_QuoteLine())),
+                      icon: const Icon(Icons.add, size: 16),
+                      label: Text('Add item',
+                          style: GoogleFonts.inter(
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                    ),
+                    const SizedBox(width: 10),
+                    OutlinedButton.icon(
+                      onPressed: _addQuoteLineFromProducts,
+                      icon: const Icon(Icons.inventory_2_outlined, size: 16),
+                      label: Text('From products',
+                          style: GoogleFonts.inter(
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                    ),
+                  ]),
+                ]),
+          ),
+        ),
+        const SizedBox(width: 16),
+        // ── Summary + actions ──
+        SizedBox(
+          width: 300,
+          child: Column(children: [
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: AppColors.border),
+              ),
+              child: Column(children: [
+                if (_quoteNumber != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: Row(children: [
+                      Text('No.',
+                          style: GoogleFonts.inter(
+                              fontSize: 12, color: AppColors.textMuted)),
+                      const Spacer(),
+                      Text(_quoteNumber!,
+                          style: GoogleFonts.inter(
+                              fontSize: 12, fontWeight: FontWeight.w600)),
+                    ]),
+                  ),
+                Row(children: [
+                  Text('Subtotal',
+                      style: GoogleFonts.inter(
+                          fontSize: 13, color: AppColors.textMuted)),
+                  const Spacer(),
+                  Text('$_currencySymbol${_quoteSubtotal.toStringAsFixed(2)}',
+                      style: GoogleFonts.inter(
+                          fontSize: 13, fontWeight: FontWeight.w600)),
+                ]),
+                const SizedBox(height: 8),
+                Row(children: [
+                  SizedBox(
+                    width: 22, height: 22,
+                    child: Checkbox(
+                      value: _quoteApplyTax,
+                      onChanged: (v) =>
+                          setState(() => _quoteApplyTax = v ?? true),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text('$_taxLabel ($_taxRateDisplay%)',
+                      style: GoogleFonts.inter(
+                          fontSize: 13, color: AppColors.textMuted)),
+                  const Spacer(),
+                  Text('$_currencySymbol${_quoteTaxAmount.toStringAsFixed(2)}',
+                      style: GoogleFonts.inter(
+                          fontSize: 13, fontWeight: FontWeight.w600)),
+                ]),
+                const Divider(height: 24, color: AppColors.border),
+                Row(children: [
+                  Text('Total',
+                      style: GoogleFonts.manrope(
+                          fontSize: 15, fontWeight: FontWeight.w700)),
+                  const Spacer(),
+                  Text(
+                      '$_currencySymbol${(_quoteSubtotal + _quoteTaxAmount).toStringAsFixed(2)}',
+                      style: GoogleFonts.manrope(
+                          fontSize: 17, fontWeight: FontWeight.w800)),
+                ]),
+              ]),
+            ),
+            const SizedBox(height: 14),
+            _quoteActionButton(
+                'Print Quotation', Icons.print_outlined, _printQuotation,
+                filled: true),
+            const SizedBox(height: 8),
+            _quoteActionButton(
+                'Save as PDF', Icons.picture_as_pdf_outlined, _saveQuotationPdf),
+            const SizedBox(height: 8),
+            _quoteActionButton(
+                'Send / Share', Icons.ios_share_outlined, _shareQuotation),
+            const SizedBox(height: 8),
+            _quoteActionButton('Clear', Icons.delete_outline, _clearQuotation),
+          ]),
+        ),
+      ]),
     );
   }
 
@@ -10809,7 +12365,7 @@ end tell
                   final filtered = txList.where((t) {
                     if (_salesSearchQuery.isEmpty) return true;
                     final q = _salesSearchQuery.toLowerCase();
-                    final inv = t.id.substring(0, 6).toUpperCase();
+                    final inv = billNo(t);
                     return (t.customerName?.toLowerCase().contains(q) ?? false) ||
                         t.items.any((i) => i.productName.toLowerCase().contains(q)) ||
                         t.paymentMethod.toLowerCase().contains(q) ||
@@ -10819,10 +12375,20 @@ end tell
                   return filtered.asMap().entries.map((entry) {
                     final idx = entry.key;
                     final t = entry.value;
-                    final invoiceNo = '#${t.id.substring(0, 6).toUpperCase()}';
-                    final itemCount = t.items.fold(0, (s, i) => s + i.quantity);
+                    final invoiceNo = '#${billNo(t)}';
+                    final isReturnRow = t.paymentMethod.toLowerCase() == 'refund' ||
+                        t.paymentMethod.toLowerCase().startsWith('exchange-') ||
+                        (t.invoiceNumber ?? '').startsWith('R-');
+                    final hasExchangeItems = t.items.any((i) => i.quantity > 0);
+                    // Returns carry negative quantities; show how many pieces
+                    // moved rather than a confusing net of -1 or 0.
+                    final itemCount = isReturnRow
+                        ? t.items.fold(0, (s, i) => s + i.quantity.abs())
+                        : t.items.fold(0, (s, i) => s + i.quantity);
                     final customer = (t.customerName?.isNotEmpty == true) ? t.customerName! : '—';
-                    final payLabel = {'cash': 'Cash', 'card': 'Card', 'upi': 'UPI/QR', 'hybrid': 'Hybrid'}[t.paymentMethod] ?? t.paymentMethod;
+                    final payLabel = isReturnRow
+                        ? (hasExchangeItems ? 'Exchange' : 'Refund')
+                        : {'cash': 'Cash', 'card': 'Card', 'upi': 'UPI/QR', 'hybrid': 'Hybrid'}[t.paymentMethod] ?? t.paymentMethod;
                     return Column(children: [
                       InkWell(
                         onTap: () => _showTransactionDetail(t),
@@ -10831,11 +12397,32 @@ end tell
                           padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 12),
                           child: Row(children: [
                             Expanded(flex: 3, child: Text(fmtDate(t.createdAt), style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted))),
-                            Expanded(flex: 3, child: Text(invoiceNo, style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.primary))),
+                            Expanded(
+                                flex: 3,
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(invoiceNo,
+                                        style: GoogleFonts.inter(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: AppColors.primary)),
+                                    const SizedBox(height: 3),
+                                    Wrap(
+                                      spacing: 4,
+                                      runSpacing: 3,
+                                      children: [
+                                        for (final badge
+                                            in _billBadges(txList, t))
+                                          _badgeChip(badge.$1, badge.$2),
+                                      ],
+                                    ),
+                                  ],
+                                )),
                             Expanded(flex: 4, child: Text(customer, style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w500, color: AppColors.textDark), overflow: TextOverflow.ellipsis)),
                             Expanded(flex: 2, child: Text('$itemCount item${itemCount == 1 ? '' : 's'}', style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted))),
                             Expanded(flex: 2, child: Text(payLabel, style: GoogleFonts.inter(fontSize: 12, color: AppColors.textDark))),
-                            Expanded(flex: 2, child: Text('$_currencySymbol${t.total.toStringAsFixed(2)}', textAlign: TextAlign.right, style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.textDark))),
+                            Expanded(flex: 2, child: Text(_fmtComma(t.total), textAlign: TextAlign.right, style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.textDark))),
                           ]),
                         ),
                       ),
@@ -10857,7 +12444,7 @@ end tell
     final dateStr = '${dt.day.toString().padLeft(2,'0')} ${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][dt.month-1]} ${dt.year}';
     final h = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
     final timeStr = '$h:${dt.minute.toString().padLeft(2,'0')} ${dt.hour < 12 ? 'AM' : 'PM'}';
-    final invoiceNo = '#${t.id.substring(0, 6).toUpperCase()}';
+    final invoiceNo = '#${billNo(t)}';
 
     showDialog(
       context: context,
@@ -12408,6 +13995,30 @@ class _CategoryChipState extends State<_CategoryChip> {
   }
 }
 
+/// One editable quotation line: name + unit price + quantity.
+class _QuoteLine {
+  final TextEditingController name;
+  final TextEditingController price;
+  int qty;
+
+  /// Set when the line came from the product picker (used by the
+  /// Return/Exchange flow so stock adjusts on the right product/variant).
+  String? productId;
+  String? variantIdRef;
+
+  _QuoteLine({String initialName = '', String initialPrice = '', this.qty = 1})
+      : name = TextEditingController(text: initialName),
+        price = TextEditingController(text: initialPrice);
+
+  double get priceValue => double.tryParse(price.text.trim()) ?? 0;
+  double get total => priceValue * qty;
+
+  void dispose() {
+    name.dispose();
+    price.dispose();
+  }
+}
+
 // Hover-aware dropdown nav tab (Reports / Utilities)
 class _DropdownNavHover extends StatefulWidget {
   final bool selected;
@@ -12690,11 +14301,11 @@ class _ProductCardState extends State<_ProductCard> {
                     const SizedBox(height: 8),
                     // Base price, or a price range when variants differ.
                     Text(() {
-                      if (variants.isEmpty) return '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}';
+                      if (variants.isEmpty) return fmtMoney(widget.currencySymbol, widget.product.price);
                       final prices = variants.map((v) => v.price).toList()..sort();
                       return prices.first == prices.last
-                          ? '${widget.currencySymbol}${prices.first.toStringAsFixed(2)}'
-                          : '${widget.currencySymbol}${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
+                          ? fmtMoney(widget.currencySymbol, prices.first)
+                          : '${fmtMoney(widget.currencySymbol, prices.first, decimals: 0)}–${fmtMoney('', prices.last, decimals: 0)}';
                     }(), style: GoogleFonts.manrope(fontSize: 16, fontWeight: FontWeight.w900, color: AppColors.primary, letterSpacing: -0.5)),
                   ],
                 ),
@@ -12808,7 +14419,7 @@ class _VariantCardState extends State<_VariantCard> {
                       Text(widget.product.name.toUpperCase(), maxLines: 1, overflow: TextOverflow.ellipsis,
                           style: GoogleFonts.inter(fontSize: 9, fontWeight: FontWeight.w300, color: AppColors.textMuted.withValues(alpha: 0.7), letterSpacing: 0.8)),
                       const SizedBox(height: 8),
-                      Text('${widget.currencySymbol}${widget.variant.price.toStringAsFixed(2)}',
+                      Text(fmtMoney(widget.currencySymbol, widget.variant.price),
                           style: GoogleFonts.manrope(fontSize: 16, fontWeight: FontWeight.w900, color: AppColors.primary, letterSpacing: -0.5)),
                     ],
                   ),
@@ -12938,9 +14549,9 @@ class _CartRowState extends State<_CartRow> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                Text('${widget.currencySymbol}${widget.item.total.toStringAsFixed(2)}',
+                Text(fmtMoney(widget.currencySymbol, widget.item.total),
                     style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.primary)),
-                Text('${widget.currencySymbol}${widget.item.unitPrice.toStringAsFixed(2)}/${widget.item.product.unit}',
+                Text('${fmtMoney(widget.currencySymbol, widget.item.unitPrice)}/${widget.item.product.unit}',
                     style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted.withValues(alpha: 0.6), fontWeight: FontWeight.w300)),
               ],
             ),

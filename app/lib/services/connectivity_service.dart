@@ -114,7 +114,11 @@ class ConnectivityService extends ChangeNotifier {
               'payment_method': t.paymentMethod,
               'created_at': t.createdAt.toIso8601String(),
               'items': t.items.map((i) => i.toMap()).toList(),
-              'invoice_number': t.id.replaceAll('-', '').substring(0, 6).toUpperCase(),
+              'invoice_number': (t.invoiceNumber?.isNotEmpty == true)
+                  ? t.invoiceNumber
+                  // Legacy bills never got a number: keep the id slice
+                  // the app already displays for them.
+                  : t.id.replaceAll('-', '').substring(0, 6).toUpperCase(),
             }).toList(),
           );
           for (final t in unsyncedTx) {
@@ -143,7 +147,11 @@ class ConnectivityService extends ChangeNotifier {
               'payment_method': t.paymentMethod,
               'created_at': t.createdAt.toIso8601String(),
               'items': t.items.map((i) => i.toMap()).toList(),
-              'invoice_number': t.id.replaceAll('-', '').substring(0, 6).toUpperCase(),
+              'invoice_number': (t.invoiceNumber?.isNotEmpty == true)
+                  ? t.invoiceNumber
+                  // Legacy bills never got a number: keep the id slice
+                  // the app already displays for them.
+                  : t.id.replaceAll('-', '').substring(0, 6).toUpperCase(),
             }).toList(),
           );
           debugPrint('Backfilled invoice_number for ${toBackfill.length} transactions');
@@ -282,6 +290,10 @@ class ConnectivityService extends ChangeNotifier {
       final txs = (txRows as List)
           .map((r) => TransactionRecord(
                 id: r['id'],
+                // Without this the pull rebuilt every bill without its
+                // number, so synced bills fell back to an id slice and the
+                // same bill showed different numbers on each device.
+                invoiceNumber: r['invoice_number'] as String?,
                 customerName: r['customer_name'],
                 customerPhone: r['customer_phone'],
                 items: (r['items'] as List)

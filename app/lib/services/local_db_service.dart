@@ -39,7 +39,7 @@ class LocalDbService {
     final dbPath = await _appSupportPath();
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 16,
+      version: 17,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 4) {
           try { await db.execute('ALTER TABLE products ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
@@ -109,6 +109,50 @@ class LocalDbService {
           try { await db.execute("ALTER TABLE products ADD COLUMN supplier TEXT NOT NULL DEFAULT ''"); } catch (_) {}
           try { await db.execute("ALTER TABLE products ADD COLUMN purchase_date TEXT"); } catch (_) {}
         }
+        if (oldVersion < 17) {
+          // invoice_number was declared INTEGER, so SQLite's numeric affinity
+          // mangled text bill numbers: "12E456" became Infinity, "123E45"
+          // became 1.23e+47, leading zeros vanished. Rebuild the column as
+          // TEXT (affinity is per-column and can only change by rebuild).
+          try {
+            await db.execute('ALTER TABLE transactions RENAME TO _tx_old');
+            await db.execute('''
+              CREATE TABLE transactions (
+                id TEXT PRIMARY KEY,
+                customer_name TEXT,
+                customer_phone TEXT,
+                items TEXT NOT NULL,
+                subtotal REAL NOT NULL,
+                discount_amount REAL NOT NULL,
+                tax_amount REAL NOT NULL,
+                total REAL NOT NULL,
+                payment_method TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                synced INTEGER NOT NULL DEFAULT 0,
+                invoice_number TEXT
+              )
+            ''');
+            await db.execute('''
+              INSERT INTO transactions
+                (id, customer_name, customer_phone, items, subtotal,
+                 discount_amount, tax_amount, total, payment_method,
+                 created_at, synced, invoice_number)
+              SELECT id, customer_name, customer_phone, items, subtotal,
+                 discount_amount, tax_amount, total, payment_method,
+                 created_at, synced,
+                 CASE
+                   WHEN invoice_number IS NULL THEN NULL
+                   -- Values already destroyed by the old affinity can't be
+                   -- recovered; drop them so the app falls back to the id
+                   -- slice and a later cloud pull can supply the real one.
+                   WHEN CAST(invoice_number AS TEXT) IN ('Inf', '-Inf') THEN NULL
+                   ELSE CAST(invoice_number AS TEXT)
+                 END
+              FROM _tx_old
+            ''');
+            await db.execute('DROP TABLE _tx_old');
+          } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -149,7 +193,7 @@ class LocalDbService {
         payment_method TEXT NOT NULL,
         created_at TEXT NOT NULL,
         synced INTEGER NOT NULL DEFAULT 0,
-        invoice_number INTEGER
+        invoice_number TEXT
       )
     ''');
     await db.execute('''
@@ -384,6 +428,67 @@ class LocalDbService {
 
   // ── Transactions ──────────────────────────────────────────────────────────
 
+  /// Records a return/exchange transaction. Unlike [insertTransaction],
+  /// items with NEGATIVE quantities are returns and their stock is added
+  /// back; positive quantities (exchange items) deduct stock with the same
+  /// floor-at-zero rule as a sale. Kept separate so the sale path's stock
+  /// math stays untouched.
+  static Future<void> insertReturnTransaction(TransactionRecord t) async {
+    final database = await db;
+    await database.insert(
+      'transactions',
+      t.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    for (final item in t.items) {
+      if (item.productId.isEmpty) continue; // custom line, nothing to stock
+      final rows = await database.query(
+        'products',
+        where: 'id = ?',
+        whereArgs: [item.productId],
+        limit: 1,
+      );
+      if (rows.isEmpty) continue;
+      final row = rows.first;
+
+      // Variants live as JSON on the product row (same shape the sale path
+      // uses): adjust that variant and keep base stock = sum of variants.
+      if (item.variantId != null) {
+        final variants = decodeVariants(row['variants']);
+        final idx = variants.indexWhere((v) => v.id == item.variantId);
+        if (idx != -1) {
+          final v = variants[idx];
+          variants[idx] = v.copyWith(stock: _restocked(v.stock, item.quantity));
+          final sum = variants.fold<int>(0, (s, v) => s + v.stock);
+          await database.update(
+            'products',
+            {'variants': encodeVariants(variants), 'stock': sum, 'synced': 0},
+            where: 'id = ?',
+            whereArgs: [item.productId],
+          );
+          continue;
+        }
+      }
+
+      final current = row['stock'] as int;
+      await database.update(
+        'products',
+        {'stock': _restocked(current, item.quantity), 'synced': 0},
+        where: 'id = ?',
+        whereArgs: [item.productId],
+      );
+    }
+  }
+
+  /// Stock after a return line. Negative quantity = goods coming back, so
+  /// stock rises. Positive quantity = an exchange item leaving the shop, so
+  /// stock falls but never below zero (matching the sale path).
+  static int _restocked(int current, int quantity) => quantity < 0
+      ? current - quantity
+      : (current - quantity) < 0
+          ? 0
+          : current - quantity;
+
   static Future<void> insertTransaction(TransactionRecord t) async {
     final database = await db;
     await database.insert('transactions', t.toMap(),
@@ -582,6 +687,21 @@ class LocalDbService {
       'UPDATE customers SET credit_balance = credit_balance + ?, synced = 0 WHERE phone = ?',
       [amount, phone],
     );
+  }
+
+  /// Outstanding credit (udhaar) for a customer, 0 when unknown.
+  static Future<double> creditBalanceForPhone(String phone) async {
+    if (phone.trim().isEmpty) return 0;
+    final database = await db;
+    final rows = await database.query(
+      'customers',
+      columns: ['credit_balance'],
+      where: 'phone = ?',
+      whereArgs: [phone.trim()],
+      limit: 1,
+    );
+    if (rows.isEmpty) return 0;
+    return (rows.first['credit_balance'] as num?)?.toDouble() ?? 0;
   }
 
   static Future<List<TransactionRecord>> getTransactionsByCustomer(String name, String? phone) async {

@@ -1,8 +1,8 @@
 {
-  "version": "1.1.6",
-  "build": 51,
-  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.6/BillCat-1.1.6.zip",
-  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.6/BillCat-1.1.6.dmg",
-  "release_notes": "Barcode label overhaul: EAN-13 barcodes auto-sized and centered on every sticker, multi-column label rolls with gaps supported, printer gap calibration, and clear errors when the printer is off. Receipt logo now prints correctly on all printer models.",
+  "version": "1.1.7",
+  "build": 52,
+  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.7/BillCat-1.1.7.zip",
+  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.7/BillCat-1.1.7.dmg",
+  "release_notes": "Returns and exchanges with automatic restocking and refund calculation, new Quotation screen, matching invoice numbers across devices, and Indian comma formatting for amounts.",
   "mandatory": false
 }
