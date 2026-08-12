@@ -1,8 +1,8 @@
 {
-  "version": "1.1.7",
-  "build": 52,
-  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.7/BillCat-1.1.7.zip",
-  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.7/BillCat-1.1.7.dmg",
-  "release_notes": "Returns and exchanges with automatic restocking and refund calculation, new Quotation screen, matching invoice numbers across devices, and Indian comma formatting for amounts.",
+  "version": "1.1.8",
+  "build": 53,
+  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.8/BillCat-1.1.8.zip",
+  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.8/BillCat-1.1.8.dmg",
+  "release_notes": "Hybrid cash + UPI payments with the split printed on the receipt, a Cash vs Bank box in the sales report, and a custom period picker for any day, month, year or date range.",
   "mandatory": false
 }

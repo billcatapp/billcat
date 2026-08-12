@@ -183,6 +183,18 @@ class _BillingScreenState extends State<BillingScreen> {
   String _reportView    = 'Sales';
   String _utilitiesView = 'Quotation';
 
+  // ── Hybrid payment split (cash + UPI) ───────────────────────────────────
+  // Kept as plain controllers on the billing screen: the split is recorded
+  // into the transaction's payment method string at checkout, so it needs no
+  // schema change and syncs like any other bill field.
+  final TextEditingController _hybridCashCtrl = TextEditingController();
+  final TextEditingController _hybridUpiCtrl = TextEditingController();
+  // The barcode-scanner key handler swallows digits typed on the billing tab
+  // unless it can see that a known field has focus, so these must exist and
+  // be registered in _handleHardwareKey.
+  final FocusNode _hybridCashFocus = FocusNode();
+  final FocusNode _hybridUpiFocus = FocusNode();
+
   // ── Quotation screen state ──────────────────────────────────────────────
   final List<_QuoteLine> _quoteLines = [];
   final TextEditingController _quoteCustomerCtrl = TextEditingController();
@@ -256,6 +268,15 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // Sales report period
   String _reportSalesPeriod = 'This Week';
+
+  // ── Custom sales period ─────────────────────────────────────────────────
+  // Set when the user picks a specific day, month, year or free range; the
+  // metrics below are computed from the transactions in that window.
+  DateTimeRange? _customRange; // reloaded after each sale/return
+  String _customRangeLabel = 'Custom';
+  List<TransactionRecord> _customTx = const [];
+  double _customSales = 0, _customProfit = 0;
+  int _customTxCount = 0, _customItems = 0;
   List<TransactionRecord> _txListToday = [];
   List<TransactionRecord> _txListWeek  = [];
   List<TransactionRecord> _txListMonth = [];
@@ -622,6 +643,11 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   Future<void> _loadDashboardData() async {
+    // Keep a custom period in step with new sales, returns and edits.
+    final custom = _customRange;
+    if (custom != null && _reportSalesPeriod == 'Custom') {
+      unawaited(_loadCustomPeriod(custom, _customRangeLabel));
+    }
     final today     = DateTime.now();
     final yesterday = today.subtract(const Duration(days: 1));
 
@@ -823,6 +849,10 @@ class _BillingScreenState extends State<BillingScreen> {
     }
     _quoteCustomerCtrl.dispose();
     _quotePhoneCtrl.dispose();
+    _hybridCashCtrl.dispose();
+    _hybridUpiCtrl.dispose();
+    _hybridCashFocus.dispose();
+    _hybridUpiFocus.dispose();
     _customerNameFocus.dispose();
     _customerPhoneFocus.dispose();
     _addCustomerFocus.dispose();
@@ -3251,7 +3281,15 @@ class _BillingScreenState extends State<BillingScreen> {
             children: methods.map((m) {
               final selected = cart.paymentMethod == m.$1;
               return Expanded(child: GestureDetector(
-                onTap: () => cart.setPaymentMethod(m.$1),
+                onTap: () {
+                  // A split belongs to the bill it was typed for: dropping
+                  // hybrid (or re-picking it) must not leave stale amounts.
+                  if (m.$1 != PaymentMethod.hybrid) {
+                    _hybridCashCtrl.clear();
+                    _hybridUpiCtrl.clear();
+                  }
+                  cart.setPaymentMethod(m.$1);
+                },
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 150),
                   padding: const EdgeInsets.symmetric(
@@ -3303,8 +3341,279 @@ class _BillingScreenState extends State<BillingScreen> {
               ));
             }).toList(),
           ),
+          if (cart.paymentMethod == PaymentMethod.hybrid)
+            _buildHybridSplit(cart),
         ],
       ),
+    );
+  }
+
+  /// One box showing where the period's money actually sits: notes in the
+  /// drawer vs money that landed in the bank (card, UPI, and the UPI half of
+  /// hybrid bills). Refunds are already netted off because their totals are
+  /// negative.
+  Widget _buildCashBankCard(List<TransactionRecord> txList) {
+    double cash = 0, bank = 0;
+    for (final t in txList) {
+      final split = _cashBankSplit(t);
+      cash += split.$1;
+      bank += split.$2;
+    }
+    final total = cash + bank;
+    final sales = txList.fold<double>(0, (s, t) => s + t.total);
+    final unallocated = sales - total;
+    final cashPct = total.abs() < 0.01 ? 0.0 : (cash / total).clamp(0.0, 1.0);
+
+    Widget half(String label, double amount, IconData icon, Color color,
+        String sub) {
+      return Expanded(
+        child: Row(children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.10),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, size: 19, color: color),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label.toUpperCase(),
+                    style: GoogleFonts.inter(
+                        fontSize: 9,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 1.4,
+                        color: AppColors.textMuted)),
+                const SizedBox(height: 3),
+                Text(fmtMoney(_currencySymbol, amount),
+                    style: GoogleFonts.manrope(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w800,
+                        color: AppColors.textDark)),
+                Text(sub,
+                    style: GoogleFonts.inter(
+                        fontSize: 10, color: AppColors.textMuted)),
+              ],
+            ),
+          ),
+        ]),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(children: [
+        Row(children: [
+          half('Cash in hand', cash, Icons.payments_outlined,
+              const Color(0xFF16A34A), 'notes in the drawer'),
+          Container(
+              width: 1,
+              height: 44,
+              color: AppColors.border,
+              margin: const EdgeInsets.symmetric(horizontal: 16)),
+          half('Bank / digital', bank, Icons.account_balance_outlined,
+              const Color(0xFF2563EB), 'card, UPI and hybrid'),
+        ]),
+        if (unallocated.abs() >= 0.01)
+          Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: Row(children: [
+              const Icon(Icons.info_outline,
+                  size: 13, color: Color(0xFFD97706)),
+              const SizedBox(width: 5),
+              Expanded(
+                child: Text(
+                    '${fmtMoney(_currencySymbol, unallocated)} not attributed '
+                    '(unpaid dues or hybrid bills closed without a split)',
+                    style: GoogleFonts.inter(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                        color: const Color(0xFFD97706))),
+              ),
+            ]),
+          ),
+        const SizedBox(height: 14),
+        // Proportion bar: green = cash, blue = bank.
+        ClipRRect(
+          borderRadius: BorderRadius.circular(20),
+          child: SizedBox(
+            height: 7,
+            child: Row(children: [
+              Expanded(
+                  flex: (cashPct * 1000).round().clamp(0, 1000),
+                  child: Container(color: const Color(0xFF16A34A))),
+              Expanded(
+                  flex: ((1 - cashPct) * 1000).round().clamp(0, 1000),
+                  child: Container(color: const Color(0xFF2563EB))),
+            ]),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  /// Parses an amount typed at the counter: cashiers type "1,500" and
+  /// sometimes paste the currency symbol, both of which double.tryParse
+  /// rejects (silently becoming 0 and mis-recording the split).
+  static double parseAmount(String raw) {
+    final cleaned =
+        raw.replaceAll(RegExp(r'[^0-9.\-]'), '');
+    return double.tryParse(cleaned) ?? 0;
+  }
+
+  /// Splits a bill's total into cash-in-drawer vs money-in-bank.
+  /// Handles hybrid bills stored as "Cash 500.00 + UPI 1500.00", card/UPI
+  /// sales, and refunds (which take money back out of the drawer).
+  (double cash, double bank) _cashBankSplit(TransactionRecord t) {
+    final m = t.paymentMethod.toLowerCase();
+
+    // Hybrid split: read the two amounts actually recorded on the bill.
+    if (m.contains(' + ') ||
+        m.contains('paid ') ||
+        m.startsWith('cash ') ||
+        m.startsWith('upi ')) {
+      double part(String key) {
+        final match = RegExp('$key\\s+([0-9]+\\.?[0-9]*)').firstMatch(m);
+        return match == null ? 0 : (double.tryParse(match.group(1)!) ?? 0);
+      }
+
+      return (part('cash'), part('upi') + part('card'));
+    }
+    // Part-paid (udhaar) bills: only what was actually collected counts.
+    final paidMatch = RegExp(r'paid\s+([0-9]+\.?[0-9]*)').firstMatch(m);
+    final received = paidMatch != null
+        ? (double.tryParse(paidMatch.group(1)!) ?? t.total)
+        : t.total;
+
+    if (m.startsWith('card') || m.startsWith('upi') ||
+        m.startsWith('exchange-card') || m.startsWith('exchange-upi')) {
+      return (0, received);
+    }
+    // An unsplit hybrid bill is genuinely unknown: counting it as cash
+    // invents notes that aren't in the drawer, so leave it out of both
+    // buckets (the "unallocated" line on the card explains the gap).
+    if (m == 'hybrid' || m.startsWith('hybrid ')) return (0, 0);
+    // Cash sales, cash top-ups, and refunds (negative totals) hit the drawer.
+    return (received, 0);
+  }
+
+  /// Human label for a stored payment method, expanding a hybrid split
+  /// ("hybrid:cash=500.00,upi=1500.00") into "Cash Rs.500 + UPI Rs.1,500".
+  String payLabelFor(String method) {
+    final m = method.toLowerCase();
+    // Hybrid bills store their split as "Cash 500.00 + UPI 1500.00":
+    // already readable, just add the currency symbol for on-screen display.
+    if (m.contains(' + ') || m.startsWith('cash ') || m.startsWith('upi ')) {
+      return method.replaceAllMapped(
+          RegExp(r'([0-9]+\.?[0-9]*)'),
+          (mt) => fmtMoney(
+              _currencySymbol, double.tryParse(mt.group(1)!) ?? 0));
+    }
+    return {
+          'cash': 'Cash',
+          'card': 'Card',
+          'upi': 'UPI/QR',
+          'hybrid': 'Hybrid',
+        }[m] ??
+        method;
+  }
+
+  /// Payment string stored on the bill. For a hybrid bill this encodes the
+  /// split ("hybrid:cash=500.00,upi=1500.00") so the cash drawer and UPI
+  /// takings can be reconciled; every other method is unchanged (null).
+  String? _hybridPaymentLabel(CartProvider cart) {
+    if (cart.paymentMethod != PaymentMethod.hybrid) return null;
+    final cash = parseAmount(_hybridCashCtrl.text);
+    final upi = parseAmount(_hybridUpiCtrl.text);
+    if (cash <= 0 && upi <= 0) return null; // nothing entered: plain 'hybrid'
+    // Printed receipts render this string directly (uppercased), so keep it
+    // readable — "Cash 500.00 + UPI 1500.00" prints correctly everywhere,
+    // including on the thermal printer's ASCII-only character set.
+    final bits = <String>[
+      if (cash > 0) 'Cash ${cash.toStringAsFixed(2)}',
+      if (upi > 0) 'UPI ${upi.toStringAsFixed(2)}',
+    ];
+    return bits.join(' + ');
+  }
+
+  /// Cash + UPI split shown under the payment row when Hybrid is picked.
+  /// Typing one side fills the other so the two always add up to the bill.
+  Widget _buildHybridSplit(CartProvider cart) {
+    final total = cart.total;
+    final cash = parseAmount(_hybridCashCtrl.text);
+    final upi = parseAmount(_hybridUpiCtrl.text);
+    final diff = total - (cash + upi);
+
+    Widget field(String label, TextEditingController ctrl, FocusNode focus,
+        IconData icon, void Function(String) onChanged) {
+      return Expanded(
+        child: TextField(
+          controller: ctrl,
+          focusNode: focus,
+          onChanged: onChanged,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600),
+          decoration: InputDecoration(
+            labelText: label,
+            labelStyle: GoogleFonts.inter(fontSize: 11),
+            prefixIcon: Icon(icon, size: 15),
+            prefixText: _currencySymbol,
+            isDense: true,
+            border:
+                OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Column(children: [
+        Row(children: [
+          field('Cash', _hybridCashCtrl, _hybridCashFocus,
+              Icons.payments_outlined, (v) {
+            // clamp(0, total) throws when total is negative, so bound it
+            // manually and keep the remainder sane.
+            final rest = total - parseAmount(v);
+            _hybridUpiCtrl.text = rest <= 0 ? '' : rest.toStringAsFixed(2);
+            setState(() {});
+          }),
+          const SizedBox(width: 8),
+          field('UPI', _hybridUpiCtrl, _hybridUpiFocus, Icons.qr_code_2, (v) {
+            final rest = total - parseAmount(v);
+            _hybridCashCtrl.text = rest <= 0 ? '' : rest.toStringAsFixed(2);
+            setState(() {});
+          }),
+        ]),
+        if (diff.abs() >= 0.01)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Row(children: [
+              Icon(Icons.info_outline,
+                  size: 13,
+                  color: diff > 0 ? const Color(0xFFD97706) : Colors.red),
+              const SizedBox(width: 5),
+              Text(
+                  diff > 0
+                      ? '${fmtMoney(_currencySymbol, diff)} still unallocated'
+                      : '${fmtMoney(_currencySymbol, -diff)} over the bill total',
+                  style: GoogleFonts.inter(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color:
+                          diff > 0 ? const Color(0xFFD97706) : Colors.red)),
+            ]),
+          ),
+      ]),
     );
   }
 
@@ -6666,6 +6975,8 @@ class _BillingScreenState extends State<BillingScreen> {
           ElevatedButton(
             onPressed: () {
               cart.clearCart();
+              _hybridCashCtrl.clear();
+              _hybridUpiCtrl.clear();
               Navigator.pop(context);
             },
             style: ElevatedButton.styleFrom(
@@ -6703,7 +7014,9 @@ class _BillingScreenState extends State<BillingScreen> {
         discountAmount: cart.discountAmount,
         taxAmount: cart.taxAmount,
         total: cart.total,
-        paymentMethod: cart.paymentMethod.name,
+        // Receipts print this verbatim, so a hybrid bill must carry its
+        // split here too — otherwise the customer's copy just says "hybrid".
+        paymentMethod: _hybridPaymentLabel(cart) ?? cart.paymentMethod.name,
         createdAt: DateTime.now(),
         invoiceNumber: invoiceNumber,
       );
@@ -7183,6 +7496,29 @@ class _BillingScreenState extends State<BillingScreen> {
       );
 
   void _closeBill(BuildContext context, CartProvider cart) {
+    // A hybrid bill must carry a split that actually adds up, or the Cash vs
+    // Bank report (and the drawer count behind it) silently goes wrong.
+    if (cart.paymentMethod == PaymentMethod.hybrid) {
+      final cash = parseAmount(_hybridCashCtrl.text);
+      final upi = parseAmount(_hybridUpiCtrl.text);
+      final diff = cart.total - (cash + upi);
+      if (cash <= 0 && upi <= 0) {
+        _showToast(
+            'Enter how much is cash and how much is UPI before closing',
+            isError: true);
+        return;
+      }
+      if (diff.abs() >= 0.01) {
+        _showToast(
+            diff > 0
+                ? '${fmtMoney(_currencySymbol, diff)} of this bill is not '
+                    'allocated — adjust the cash/UPI split'
+                : '${fmtMoney(_currencySymbol, -diff)} more than the bill '
+                    'total — adjust the cash/UPI split',
+            isError: true);
+        return;
+      }
+    }
     bool sendWaAfterClose = false;
     final hasPhone = cart.customerPhone.isNotEmpty;
     final hasWa = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
@@ -7318,7 +7654,23 @@ class _BillingScreenState extends State<BillingScreen> {
                 final phone = cart.customerPhone;
                 final creditDue = (total - (double.tryParse(paidCtrl.text) ?? total)).clamp(0.0, total);
                 Navigator.pop(ctx);
-                await cart.checkout(invoiceNumber: invNum, transactionId: txId);
+                await cart.checkout(
+                    invoiceNumber: invNum,
+                    transactionId: txId,
+                    paymentLabel: _hybridPaymentLabel(cart) ??
+                        // Part-paid bills: note what was actually collected so
+                        // the Cash vs Bank box doesn't count the unpaid half
+                        // as notes in the drawer.
+                        (creditDue > 0
+                            ? '${cart.paymentMethod.name} '
+                                '(paid ${(total - creditDue).toStringAsFixed(2)}, '
+                                'due ${creditDue.toStringAsFixed(2)})'
+                            : null));
+                _hybridCashCtrl.clear();
+                _hybridUpiCtrl.clear();
+                // Don't leave HYBRID selected for the next customer: an
+                // unnoticed empty split would book the whole bill as cash.
+                cart.setPaymentMethod(PaymentMethod.cash);
                 if (creditDue > 0 && phone.isNotEmpty) {
                   await LocalDbService.addCreditToCustomer(phone, creditDue);
                 }
@@ -10970,7 +11322,8 @@ end tell
     if (_customerNameFocus.hasFocus || _customerPhoneFocus.hasFocus ||
         _searchFocus.hasFocus || _addCustomerFocus.hasFocus ||
         _discountFocus.hasFocus || _customNameFocus.hasFocus ||
-        _customPriceFocus.hasFocus) return false;
+        _customPriceFocus.hasFocus ||
+        _hybridCashFocus.hasFocus || _hybridUpiFocus.hasFocus) return false;
 
     final logical = event.logicalKey;
 
@@ -11433,9 +11786,7 @@ end tell
                         ..._dashRecentTx.map((tx) {
                           final name = (tx.customerName?.isNotEmpty == true) ? tx.customerName! : 'Walk-in';
                           final timeStr = '${tx.createdAt.hour.toString().padLeft(2,'0')}:${tx.createdAt.minute.toString().padLeft(2,'0')}';
-                          final method = switch (tx.paymentMethod.toLowerCase()) {
-                            'cash' => 'Cash', 'card' => 'Card', 'upi' => 'UPI/QR', _ => tx.paymentMethod,
-                          };
+                          final method = payLabelFor(tx.paymentMethod);
                           final itemCount = tx.items.fold(0, (s, i) => s + i.quantity);
                           return Column(children: [
                             Padding(
@@ -12234,6 +12585,8 @@ end tell
                 _reportPeriodBtn('This Week'),
                 const SizedBox(width: 6),
                 _reportPeriodBtn('This Month'),
+                const SizedBox(width: 8),
+                _customPeriodBtn(),
               ],
             ],
           ),
@@ -12250,15 +12603,18 @@ end tell
   // ── Sales sub-view ─────────────────────────────────────────────────────────
 
   Widget _buildSalesReport() {
+    final isCustom = _reportSalesPeriod == 'Custom';
     final isToday = _reportSalesPeriod == 'Today';
     final isWeek  = _reportSalesPeriod == 'This Week';
 
-    final revenue  = isToday ? _dashSales      : isWeek ? _dashWeekSales  : _dashMonthSales;
-    final txCount  = isToday ? _dashTxCount    : isWeek ? _dashWeekTxCount : _dashMonthTxCount;
-    final items    = isToday ? _dashItemsSold  : isWeek ? _dashWeekItems   : _dashMonthItems;
-    final profit  = isToday ? _dashProfitToday : isWeek ? _dashProfitWeek  : _dashProfitMonth;
-    final txList = isToday ? _txListToday : isWeek ? _txListWeek : _txListMonth;
-    final periodLabel = isToday ? 'today' : isWeek ? 'this week' : 'this month';
+    final revenue  = isCustom ? _customSales : isToday ? _dashSales      : isWeek ? _dashWeekSales  : _dashMonthSales;
+    final txCount  = isCustom ? _customTxCount : isToday ? _dashTxCount    : isWeek ? _dashWeekTxCount : _dashMonthTxCount;
+    final items    = isCustom ? _customItems : isToday ? _dashItemsSold  : isWeek ? _dashWeekItems   : _dashMonthItems;
+    final profit  = isCustom ? _customProfit : isToday ? _dashProfitToday : isWeek ? _dashProfitWeek  : _dashProfitMonth;
+    final txList = isCustom ? _customTx : isToday ? _txListToday : isWeek ? _txListWeek : _txListMonth;
+    final periodLabel = isCustom
+        ? _customRangeLabel.toLowerCase()
+        : isToday ? 'today' : isWeek ? 'this week' : 'this month';
 
     String fmtAmt(double v) {
       final parts = v.toStringAsFixed(2).split('.');
@@ -12293,6 +12649,8 @@ end tell
           const SizedBox(width: 16),
           _reportSummaryCard('Profit',          fmtAmt(profit),  Icons.trending_up_rounded,   const Color(0xFF8B5CF6),      currencyIcon: _currencySymbol),
         ]),
+        const SizedBox(height: 16),
+        _buildCashBankCard(txList),
         const SizedBox(height: 24),
         Container(
           padding: const EdgeInsets.all(24),
@@ -12388,7 +12746,7 @@ end tell
                     final customer = (t.customerName?.isNotEmpty == true) ? t.customerName! : '—';
                     final payLabel = isReturnRow
                         ? (hasExchangeItems ? 'Exchange' : 'Refund')
-                        : {'cash': 'Cash', 'card': 'Card', 'upi': 'UPI/QR', 'hybrid': 'Hybrid'}[t.paymentMethod] ?? t.paymentMethod;
+                        : payLabelFor(t.paymentMethod);
                     return Column(children: [
                       InkWell(
                         onTap: () => _showTransactionDetail(t),
@@ -12439,7 +12797,7 @@ end tell
   }
 
   void _showTransactionDetail(TransactionRecord t) {
-    final payLabel = {'cash': 'Cash', 'card': 'Card', 'upi': 'UPI/QR', 'hybrid': 'Hybrid'}[t.paymentMethod] ?? t.paymentMethod;
+    final payLabel = payLabelFor(t.paymentMethod);
     final dt = t.createdAt;
     final dateStr = '${dt.day.toString().padLeft(2,'0')} ${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][dt.month-1]} ${dt.year}';
     final h = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
@@ -13220,11 +13578,14 @@ end tell
   }
 
   Widget _buildPasscodeDialog(String title, String subtitle, ValueNotifier<String> digits, BuildContext ctx, FocusNode keyboardFocus) {
-    return KeyboardListener(
+    // Focus (not KeyboardListener): KeyboardListener only *observes* keys and
+    // never marks them handled, so macOS treated every passcode keystroke as
+    // unhandled input and played the system alert beep.
+    return Focus(
       focusNode: keyboardFocus,
       autofocus: true,
-      onKeyEvent: (event) {
-        if (event is! KeyDownEvent) return;
+      onKeyEvent: (node, event) {
+        if (event is! KeyDownEvent) return KeyEventResult.handled;
         final key = event.logicalKey;
         if (key == LogicalKeyboardKey.backspace || key == LogicalKeyboardKey.delete) {
           if (digits.value.isNotEmpty) {
@@ -13238,6 +13599,7 @@ end tell
             digits.value = digits.value + ch;
           }
         }
+        return KeyEventResult.handled;
       },
       child: Dialog(
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
@@ -13812,6 +14174,259 @@ end tell
 
   // ── Account sub-view ───────────────────────────────────────────────────────
 
+
+  /// "Custom" chip: opens a chooser for a single day, a month, a year, or a
+  /// free date range, then loads that window's sales.
+  Widget _customPeriodBtn() {
+    final active = _reportSalesPeriod == 'Custom';
+    return GestureDetector(
+      onTap: _pickCustomPeriod,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? AppColors.primary : AppColors.surfaceVariant,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+              color: active ? AppColors.primary : AppColors.border),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.event_outlined,
+              size: 13,
+              color: active ? Colors.white : AppColors.textMuted),
+          const SizedBox(width: 6),
+          Text(active ? _customRangeLabel : 'Custom',
+              style: GoogleFonts.inter(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: active ? Colors.white : AppColors.textMuted)),
+        ]),
+      ),
+    );
+  }
+
+  /// Calendar picker for the Custom period: pick a whole year, any month of
+  /// that year, or open the day calendar for a single date or a range.
+  Future<void> _pickCustomPeriod() async {
+    final now = DateTime.now();
+    var year = _customRange?.start.year ?? now.year;
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+    ];
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) {
+        return Dialog(
+          backgroundColor: Colors.white,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          child: SizedBox(
+            width: 380,
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                // ── year navigation ──
+                Row(children: [
+                  IconButton(
+                    icon: const Icon(Icons.chevron_left, size: 20),
+                    onPressed: year > 2020
+                        ? () => setLocal(() => year--)
+                        : null,
+                  ),
+                  Expanded(
+                    child: Center(
+                      child: Text('$year',
+                          style: GoogleFonts.manrope(
+                              fontSize: 20, fontWeight: FontWeight.w800)),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.chevron_right, size: 20),
+                    onPressed: year < now.year
+                        ? () => setLocal(() => year++)
+                        : null,
+                  ),
+                ]),
+                const SizedBox(height: 6),
+                // ── months of that year ──
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  alignment: WrapAlignment.center,
+                  children: [
+                    for (var m = 1; m <= 12; m++)
+                      Builder(builder: (_) {
+                        final future = year == now.year && m > now.month;
+                        final selected = _reportSalesPeriod == 'Custom' &&
+                            _customRange != null &&
+                            _customRange!.start.year == year &&
+                            _customRange!.start.month == m &&
+                            _customRange!.start.day == 1 &&
+                            _customRange!.end.month == m;
+                        return SizedBox(
+                          width: 78,
+                          child: OutlinedButton(
+                            onPressed: future
+                                ? null
+                                : () {
+                                    final start = DateTime(year, m, 1);
+                                    final end = DateTime(year, m + 1, 0);
+                                    Navigator.pop(ctx);
+                                    _loadCustomPeriod(
+                                        DateTimeRange(start: start, end: end),
+                                        '${months[m - 1]} $year');
+                                  },
+                            style: OutlinedButton.styleFrom(
+                              backgroundColor: selected
+                                  ? AppColors.primary
+                                  : Colors.white,
+                              foregroundColor: selected
+                                  ? Colors.white
+                                  : AppColors.textDark,
+                              side: BorderSide(
+                                  color: selected
+                                      ? AppColors.primary
+                                      : AppColors.border),
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 10),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(9)),
+                            ),
+                            child: Text(months[m - 1],
+                                style: GoogleFonts.inter(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700)),
+                          ),
+                        );
+                      }),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                // ── whole year ──
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      final start = DateTime(year, 1, 1);
+                      final end = year == now.year
+                          ? now
+                          : DateTime(year, 12, 31);
+                      Navigator.pop(ctx);
+                      _loadCustomPeriod(
+                          DateTimeRange(start: start, end: end), '$year');
+                    },
+                    icon: const Icon(Icons.calendar_today_outlined, size: 15),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.primary,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(vertical: 13),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10)),
+                    ),
+                    label: Text('Whole year $year',
+                        style: GoogleFonts.inter(
+                            fontSize: 13, fontWeight: FontWeight.w700)),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                // ── specific date / range: the day calendar ──
+                Row(children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () async {
+                        final d = await showDatePicker(
+                          context: ctx,
+                          initialDate: now,
+                          firstDate: DateTime(2020),
+                          lastDate: now,
+                          helpText: 'Select a day',
+                        );
+                        if (d == null) return;
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        await _loadCustomPeriod(
+                            DateTimeRange(start: d, end: d), _fmtDate(d));
+                      },
+                      icon: const Icon(Icons.today_outlined, size: 15),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10)),
+                      ),
+                      label: Text('A day',
+                          style: GoogleFonts.inter(
+                              fontSize: 12, fontWeight: FontWeight.w600)),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () async {
+                        final r = await showDateRangePicker(
+                          context: ctx,
+                          firstDate: DateTime(2020),
+                          lastDate: now,
+                          helpText: 'Select a date range',
+                        );
+                        if (r == null) return;
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        await _loadCustomPeriod(r,
+                            '${_fmtDate(r.start)} - ${_fmtDate(r.end)}');
+                      },
+                      icon: const Icon(Icons.date_range_outlined, size: 15),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10)),
+                      ),
+                      label: Text('Date range',
+                          style: GoogleFonts.inter(
+                              fontSize: 12, fontWeight: FontWeight.w600)),
+                    ),
+                  ),
+                ]),
+              ]),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  /// Loads sales for [range] and switches the report to the Custom period.
+  Future<void> _loadCustomPeriod(DateTimeRange range, String label) async {
+    final txs =
+        await LocalDbService.getTransactionsForRange(range.start, range.end);
+    final products = await LocalDbService.getProducts();
+    final buying = {for (final p in products) p.id: p.buyingPrice};
+
+    bool isReturnDoc(TransactionRecord t) =>
+        t.paymentMethod.toLowerCase() == 'refund' ||
+        t.paymentMethod.toLowerCase().startsWith('exchange-') ||
+        (t.invoiceNumber ?? '').startsWith('R-');
+
+    double sales = 0, profit = 0;
+    int items = 0;
+    for (final t in txs) {
+      sales += t.total;
+      for (final i in t.items) {
+        items += i.quantity;
+        profit += (i.price - (buying[i.productId] ?? 0)) * i.quantity;
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _customRange = range;
+      _customRangeLabel = label;
+      _customTx = txs;
+      _customSales = sales;
+      _customProfit = profit;
+      _customItems = items;
+      _customTxCount = txs.where((t) => !isReturnDoc(t)).length;
+      _reportSalesPeriod = 'Custom';
+    });
+  }
 
   Widget _reportPeriodBtn(String label) {
     final active = _reportSalesPeriod == label;

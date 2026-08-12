@@ -100,7 +100,10 @@ class CartProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> checkout({String? invoiceNumber, String? transactionId}) async {
+  /// [paymentLabel] overrides the stored payment method string — used by
+  /// the hybrid split to record e.g. 'hybrid:cash=500.00,upi=1500.00'.
+  Future<void> checkout({String? invoiceNumber, String? transactionId,
+      String? paymentLabel}) async {
     final record = TransactionRecord(
       id: transactionId ?? const Uuid().v4(),
       customerName: customerName.isEmpty ? null : customerName,
@@ -117,7 +120,7 @@ class CartProvider extends ChangeNotifier {
       discountAmount: discountAmount,
       taxAmount: taxAmount,
       total: total,
-      paymentMethod: paymentMethod.name,
+      paymentMethod: paymentLabel ?? paymentMethod.name,
       createdAt: DateTime.now(),
       synced: false,
       invoiceNumber: invoiceNumber,
