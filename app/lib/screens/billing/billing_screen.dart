@@ -344,6 +344,9 @@ class _BillingScreenState extends State<BillingScreen> {
   double _barcodeLabelW = 58;
   double _barcodeLabelH = 30;
   int _barcodePerRow = 1;
+  // Die-cut gap between stickers on a multi-across roll. Without it the sheet
+  // is narrower than the liner and every column after the first drifts.
+  double _barcodeGapMm = 2;
   String _barcodePrinter = 'System Default';
 
   // Bulk barcode print view
@@ -429,6 +432,7 @@ class _BillingScreenState extends State<BillingScreen> {
     _loadProducts();
     _loadDashboardData();
     _loadSavedCustomers();
+    _loadReportDealers(); // the product form's dealer dropdown needs this list
     ConnectivityService.instance.addListener(_onSyncComplete);
     _checkForUpdate();
     _loadCurrentVersion();
@@ -528,6 +532,7 @@ class _BillingScreenState extends State<BillingScreen> {
         _barcodeLabelW = (bc['labelW'] as num?)?.toDouble() ?? _barcodeLabelW;
         _barcodeLabelH = (bc['labelH'] as num?)?.toDouble() ?? _barcodeLabelH;
         _barcodePerRow = (bc['perRow'] as num?)?.toInt() ?? _barcodePerRow;
+        _barcodeGapMm = (bc['gapMm'] as num?)?.toDouble() ?? _barcodeGapMm;
         _barcodePrinter = (bc['printer'] as String?) ?? _barcodePrinter;
       });
     }
@@ -832,6 +837,7 @@ class _BillingScreenState extends State<BillingScreen> {
 
   void _onSyncComplete() {
     _loadProducts();
+    _loadReportDealers(); // dealers added on another device → dealer dropdown
     _loadDashboardData();
   }
 
@@ -8264,7 +8270,7 @@ end tell
           ),
         );
         LabelSpec currentSpec() => LabelSpec(
-          labelWmm: _barcodeLabelW, labelHmm: _barcodeLabelH, columns: _barcodePerRow, gapMm: 2.0);
+          labelWmm: _barcodeLabelW, labelHmm: _barcodeLabelH, columns: _barcodePerRow, gapMm: _barcodeGapMm);
         LabelPrinterProfile buildProfile() => profile.copyWith(
           host: hostCtrl.text.trim(),
           port: int.tryParse(portCtrl.text.trim()) ?? 9100,
@@ -8448,6 +8454,7 @@ end tell
     final labelWCtrl  = TextEditingController(text: _barcodeLabelW.toStringAsFixed(_barcodeLabelW == _barcodeLabelW.truncateToDouble() ? 0 : 1));
     final labelHCtrl  = TextEditingController(text: _barcodeLabelH.toStringAsFixed(_barcodeLabelH == _barcodeLabelH.truncateToDouble() ? 0 : 1));
     final perRowCtrl  = TextEditingController(text: '$_barcodePerRow');
+    final gapCtrl     = TextEditingController(text: _barcodeGapMm.toStringAsFixed(_barcodeGapMm == _barcodeGapMm.truncateToDouble() ? 0 : 1));
     final searchCtrl  = TextEditingController();
     final targets     = _barcodeTargets();
     final qtys        = <String, int>{ for (final t in targets) t.key: t.stock > 0 ? t.stock : 1 };
@@ -8501,9 +8508,10 @@ end tell
           final w = double.tryParse(labelWCtrl.text) ?? _barcodeLabelW;
           final h = double.tryParse(labelHCtrl.text) ?? _barcodeLabelH;
           final perRow = int.tryParse(perRowCtrl.text) ?? _barcodePerRow;
+          final gapMm = double.tryParse(gapCtrl.text) ?? _barcodeGapMm;
           Navigator.pop(ctx);
-          setState(() { _barcodeLabelW = w; _barcodeLabelH = h; _barcodePerRow = perRow; _barcodePrinter = printer; });
-          LabelPrinterService.saveBarcodeSettings({'labelW': w, 'labelH': h, 'perRow': perRow, 'printer': printer});
+          setState(() { _barcodeLabelW = w; _barcodeLabelH = h; _barcodePerRow = perRow; _barcodeGapMm = gapMm; _barcodePrinter = printer; });
+          LabelPrinterService.saveBarcodeSettings({'labelW': w, 'labelH': h, 'perRow': perRow, 'gapMm': gapMm, 'printer': printer});
           final selTargets = targets.where((t) => selected[t.key] == true).toList();
           await _printAllBarcodesWithQty(selTargets, qtys, labelW: w, labelH: h, labelsPerRow: perRow, printerName: printer);
         }
@@ -8552,6 +8560,10 @@ end tell
                   Text('Per Row', style: GoogleFonts.inter(fontSize: 11, fontWeight: FontWeight.w500, color: AppColors.textMuted)),
                   const SizedBox(width: 7),
                   _miniNumField(perRowCtrl, '', 44),
+                  const SizedBox(width: 16),
+                  Text('Gap', style: GoogleFonts.inter(fontSize: 11, fontWeight: FontWeight.w500, color: AppColors.textMuted)),
+                  const SizedBox(width: 7),
+                  _miniNumField(gapCtrl, 'mm', 56),
                   const SizedBox(width: 16),
                   const Icon(Icons.print_outlined, size: 14, color: AppColors.textMuted),
                   const SizedBox(width: 6),
@@ -8860,7 +8872,7 @@ end tell
             count: qtys[t.key] ?? 1,
           ),
       ];
-      final spec = LabelSpec(labelWmm: labelW, labelHmm: labelH, columns: labelsPerRow, gapMm: 2.0);
+      final spec = LabelSpec(labelWmm: labelW, labelHmm: labelH, columns: labelsPerRow, gapMm: _barcodeGapMm);
       try {
         await LabelPrinterService.printBatch(items, spec, profile);
         if (mounted) _showToast('Sent to $dest');
@@ -8876,9 +8888,12 @@ end tell
     final bold    = pw.Font.ttf(boldData);
 
     final doc = pw.Document();
-    // labelW x labelH = ONE sticker; page = perRow stickers, edge-to-edge so the
-    // page width equals the physical liner width (e.g. 3 × 35mm = 105mm exactly).
-    const gapMm = 0.0;
+    // labelW x labelH = ONE sticker. A multi-across roll has a die-cut GAP
+    // between columns, so the page must be perRow stickers PLUS those gaps —
+    // that is the real liner width (e.g. 3 × 35mm + 2 × 2mm = 109mm). Assuming
+    // zero gap makes every column after the first land short of its sticker,
+    // and the error accumulates across the row.
+    final gapMm = _barcodeGapMm;
     const marginMm = 0.0;
     final gap = gapMm * PdfPageFormat.mm;
     final margin = marginMm * PdfPageFormat.mm;
@@ -8906,7 +8921,9 @@ end tell
         padding: pw.EdgeInsets.symmetric(horizontal: innerPad, vertical: 1.5 * PdfPageFormat.mm),
         child: pw.Column(mainAxisAlignment: pw.MainAxisAlignment.center, children: [
           pw.SvgImage(svg: svgStr, width: (cellW - innerPad * 2), height: (cellH - 2 * PdfPageFormat.mm) * 0.62),
-          pw.Text(t.name, style: pw.TextStyle(font: bold, fontSize: 4.5, letterSpacing: 0.4), textAlign: pw.TextAlign.center),
+          // maxLines:1 — a long name would otherwise wrap and push the price
+          // off the bottom of the sticker onto the die-cut gap.
+          pw.Text(t.name, maxLines: 1, style: pw.TextStyle(font: bold, fontSize: 4.5, letterSpacing: 0.4), textAlign: pw.TextAlign.center),
           pw.Text('$_currencySymbol${t.price.toStringAsFixed(2)}', style: pw.TextStyle(font: bold, fontSize: 4.5), textAlign: pw.TextAlign.center),
         ]),
       );
@@ -9437,6 +9454,7 @@ end tell
     final labelHCtrl = TextEditingController(text: _barcodeLabelH.toStringAsFixed(_barcodeLabelH == _barcodeLabelH.truncateToDouble() ? 0 : 1));
     final qtyCtrl = TextEditingController(text: '$qty');
     final perRowCtrl = TextEditingController(text: '$labelsPerRow');
+    final gapCtrl = TextEditingController(text: _barcodeGapMm.toStringAsFixed(_barcodeGapMm == _barcodeGapMm.truncateToDouble() ? 0 : 1));
     List<String> availablePrinters = ['System Default'];
     String selectedDialogPrinter = _barcodePrinter;
 
@@ -9579,6 +9597,8 @@ end tell
                   Expanded(child: _field('Width (mm)', labelWCtrl)),
                   const SizedBox(width: 10),
                   Expanded(child: _field('Height (mm)', labelHCtrl)),
+                  const SizedBox(width: 10),
+                  Expanded(child: _field('Gap (mm)', gapCtrl)),
                 ]),
                 const SizedBox(height: 14),
                 // Printer — styled like a segmented/filled selector
@@ -9645,19 +9665,25 @@ end tell
                   Expanded(child: ElevatedButton.icon(
                     onPressed: () {
                       Navigator.pop(ctx);
-                      final w = double.tryParse(labelWCtrl.text) ?? 58;
-                      final h = double.tryParse(labelHCtrl.text) ?? 30;
+                      // Fall back to the saved label size, not to 58×30 — a
+                      // blank field must not silently print at the default
+                      // size on stock that is a different width.
+                      final w = double.tryParse(labelWCtrl.text) ?? _barcodeLabelW;
+                      final h = double.tryParse(labelHCtrl.text) ?? _barcodeLabelH;
                       final finalQty = int.tryParse(qtyCtrl.text) ?? qty;
                       final finalPerRow = int.tryParse(perRowCtrl.text) ?? labelsPerRow;
+                      final finalGap = double.tryParse(gapCtrl.text) ?? _barcodeGapMm;
                       // Persist last-used barcode settings
                       setState(() {
                         _barcodeLabelW = w;
                         _barcodeLabelH = h;
                         _barcodePerRow = finalPerRow;
+                        _barcodeGapMm = finalGap;
                         _barcodePrinter = selectedDialogPrinter;
                       });
                       LabelPrinterService.saveBarcodeSettings({
-                        'labelW': w, 'labelH': h, 'perRow': finalPerRow, 'printer': selectedDialogPrinter,
+                        'labelW': w, 'labelH': h, 'perRow': finalPerRow, 'gapMm': finalGap,
+                        'printer': selectedDialogPrinter,
                       });
                       _printBarcode(p, quantity: finalQty, labelW: w, labelH: h, labelsPerRow: finalPerRow, printerName: selectedDialogPrinter);
                     },
@@ -9697,9 +9723,9 @@ end tell
     final bold    = pw.Font.ttf(boldData);
 
     final doc = pw.Document();
-    // labelW x labelH = ONE sticker; page = perRow stickers, edge-to-edge so the
-    // page width equals the physical liner width (e.g. 3 × 35mm = 105mm exactly).
-    const gapMm = 0.0;
+    // labelW x labelH = ONE sticker; the page is perRow stickers PLUS the
+    // die-cut gaps between them, which is the real liner width.
+    final gapMm = _barcodeGapMm;
     const marginMm = 0.0;
     final gap = gapMm * PdfPageFormat.mm;
     final margin = marginMm * PdfPageFormat.mm;
@@ -9718,7 +9744,8 @@ end tell
         mainAxisAlignment: pw.MainAxisAlignment.center,
         children: [
           pw.SvgImage(svg: svgStr, width: cellW - pad * 2, height: (cellH - 2 * PdfPageFormat.mm) * 0.62),
-          pw.Text(p.name, style: pw.TextStyle(font: bold, fontSize: 4.5, letterSpacing: 0.4), textAlign: pw.TextAlign.center),
+          // maxLines:1 — see _printAllBarcodesWithQty.
+          pw.Text(p.name, maxLines: 1, style: pw.TextStyle(font: bold, fontSize: 4.5, letterSpacing: 0.4), textAlign: pw.TextAlign.center),
           pw.Text('$_currencySymbol${p.price.toStringAsFixed(2)}', style: pw.TextStyle(font: bold, fontSize: 4.5), textAlign: pw.TextAlign.center),
         ],
       ),
@@ -9803,9 +9830,9 @@ end tell
                     // System Default resolves to the OS default printer in _printPdfBytes.
                     final targetPrinter = printerName ?? 'System Default';
                     Navigator.pop(ctx);
-                    // Sheet dimensions: side margins + perRow stickers + gaps
-                    const gapMm = 0.5;
-                    const marginMm = 2.0;
+                    // Sheet dimensions must match the page the PDF was BUILT
+                    // with (margin/gap above) — declaring a different paper
+                    // size makes the driver rescale and shift every column.
                     final sheetW = marginMm * 2 + labelsPerRow * labelW + (labelsPerRow - 1) * gapMm;
                     final sheetH = labelH;
                     await _printPdfBytes(
@@ -10125,16 +10152,58 @@ end tell
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       _dlgLabel('DEALER / SUPPLIER'),
       const SizedBox(height: 6),
-      Builder(builder: (fctx) => TextFormField(
-        controller: supplierCtrl,
-        focusNode: supplierFocus,
-        textInputAction: TextInputAction.next,
-        onFieldSubmitted: (_) => onSupplierSubmitted != null
-            ? onSupplierSubmitted()
-            : FocusScope.of(fctx).nextFocus(),
-        style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
-        decoration: _dlgInputDecor('e.g. Metro Wholesale'),
-      )),
+      // Picked from the dealers already saved under Reports → Dealers.
+      // supplierCtrl stays the single source of truth so every caller (and the
+      // product's `supplier` string) keeps working unchanged.
+      StatefulBuilder(builder: (fctx, setField) {
+        final current = supplierCtrl.text.trim();
+        // Deduplicated: two dealers saved under the same name would give the
+        // dropdown two items matching `value`, which trips its assertion.
+        final names = <String>{for (final d in _reportDealers) d.name}.toList();
+        // A supplier typed before this became a dropdown must still show.
+        if (current.isNotEmpty && !names.contains(current)) names.insert(0, current);
+        return DropdownButtonFormField<String>(
+          value: current.isEmpty ? null : current,
+          focusNode: supplierFocus,
+          isExpanded: true,
+          items: [
+            if (current.isNotEmpty)
+              DropdownMenuItem(value: '__none__',
+                  child: Text('No dealer',
+                      style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted))),
+            ...names.map((n) => DropdownMenuItem(value: n,
+                child: Text(n, maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark)))),
+            DropdownMenuItem(value: '__add_dealer__',
+                child: Row(children: [
+                  const Icon(Icons.add_rounded, size: 14, color: AppColors.accentBlue),
+                  const SizedBox(width: 6),
+                  Text('Add Dealer', style: GoogleFonts.inter(
+                      fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.accentBlue)),
+                ])),
+          ],
+          onChanged: (v) async {
+            if (v == '__add_dealer__') {
+              final added = await _showQuickAddDealerDialog(fctx);
+              if (added != null && added.isNotEmpty) {
+                supplierCtrl.text = added;
+                setField(() {});
+                onSupplierSubmitted?.call();
+              }
+            } else if (v == '__none__') {
+              supplierCtrl.text = '';
+              setField(() {});
+            } else if (v != null) {
+              supplierCtrl.text = v;
+              setField(() {});
+              onSupplierSubmitted?.call();
+            }
+          },
+          decoration: _dlgInputDecor('Select dealer'),
+          style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+          dropdownColor: Colors.white,
+        );
+      }),
       const SizedBox(height: 16),
       _dlgLabel('PURCHASE DATE'),
       const SizedBox(height: 6),
@@ -11268,6 +11337,78 @@ end tell
         ],
       ),
     );
+  }
+
+  /// Quick "add dealer" prompt for the product form's dealer dropdown. Saves
+  /// through the same path as Reports → Dealers so the new dealer shows there
+  /// too and syncs to the cloud. Returns the dealer name, or null if cancelled.
+  Future<String?> _showQuickAddDealerDialog(BuildContext ctx) async {
+    final nameCtrl = TextEditingController();
+    final phoneCtrl = TextEditingController();
+    InputDecoration decor(String hint) => InputDecoration(
+          hintText: hint,
+          hintStyle: GoogleFonts.inter(color: AppColors.textMuted, fontSize: 13),
+          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: AppColors.border)),
+          focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: AppColors.primary, width: 1.5)),
+        );
+    final entered = await showDialog<String>(
+      context: ctx,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: Text('New Dealer', style: GoogleFonts.manrope(
+            fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.textDark)),
+        content: SizedBox(
+          width: 320,
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(
+              controller: nameCtrl,
+              autofocus: true,
+              textInputAction: TextInputAction.done,
+              onSubmitted: (v) => Navigator.pop(dctx, v.trim()),
+              style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+              decoration: decor('Dealer name'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: phoneCtrl,
+              keyboardType: TextInputType.phone,
+              style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+              decoration: decor('Phone (optional)'),
+            ),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dctx),
+              child: Text('Cancel', style: GoogleFonts.inter(color: AppColors.textMuted))),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dctx, nameCtrl.text.trim()),
+            style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary, foregroundColor: Colors.white,
+                elevation: 0, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+            child: Text('Add', style: GoogleFonts.inter(fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+    final name = entered?.trim() ?? '';
+    if (name.isEmpty) return null;
+    final existing = _reportDealers
+        .where((d) => d.name.toLowerCase() == name.toLowerCase())
+        .toList();
+    if (existing.isEmpty) {
+      await _saveDealerAndSync(Dealer(
+        id: const Uuid().v4(),
+        name: name,
+        phone: phoneCtrl.text.trim(),
+        createdAt: DateTime.now(),
+      ));
+      return name;
+    }
+    return existing.first.name;
   }
 
   // Hardware keyboard handler — pure-digit sequences go silently to cart
