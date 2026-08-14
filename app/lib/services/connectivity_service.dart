@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../models/customer.dart';
 import '../models/dealer.dart';
+import '../models/dealer_purchase.dart';
 import '../models/product.dart';
 import '../models/transaction_record.dart';
 import 'local_db_service.dart';
@@ -206,6 +207,34 @@ class ConnectivityService extends ChangeNotifier {
         }
       }
 
+      // ── Sync dealer purchase history (batch) ─────────────────────────────
+      final unsyncedPurchases = await LocalDbService.getUnsyncedDealerPurchases();
+      if (unsyncedPurchases.isNotEmpty) {
+        try {
+          await client.from('dealer_purchases').upsert(
+            unsyncedPurchases.map((p) => {
+              'id': p.id,
+              'user_id': userId,
+              'dealer_id': p.dealerId,
+              'dealer_name': p.dealerName,
+              'product_id': p.productId,
+              'product_name': p.productName,
+              'qty': p.qty,
+              'unit_cost': p.unitCost,
+              'amount': p.amount,
+              'source': p.source,
+              'purchase_date': p.purchaseDate.toIso8601String(),
+              'created_at': p.createdAt.toIso8601String(),
+            }).toList(),
+          );
+          for (final p in unsyncedPurchases) {
+            await LocalDbService.markDealerPurchaseSynced(p.id);
+          }
+        } catch (e) {
+          debugPrint('Dealer purchase sync error: $e');
+        }
+      }
+
       // ── Sync categories ──────────────────────────────────────────────────
       final unsyncedCats = await LocalDbService.getUnsyncedCategories();
       if (unsyncedCats.isNotEmpty) {
@@ -349,6 +378,30 @@ class ConnectivityService extends ChangeNotifier {
               ))
           .toList();
       await LocalDbService.insertDealersSynced(dealers);
+    } catch (_) {}
+
+    try {
+      final purchaseRows = await client
+          .from('dealer_purchases')
+          .select()
+          .eq('user_id', userId);
+      final purchases = (purchaseRows as List)
+          .map((r) => DealerPurchase(
+                id: r['id'],
+                dealerId: (r['dealer_id'] as String?) ?? '',
+                dealerName: (r['dealer_name'] as String?) ?? '',
+                productId: (r['product_id'] as String?) ?? '',
+                productName: (r['product_name'] as String?) ?? '',
+                qty: (r['qty'] as num?)?.toInt() ?? 0,
+                unitCost: (r['unit_cost'] as num?)?.toDouble() ?? 0,
+                amount: (r['amount'] as num?)?.toDouble() ?? 0,
+                source: (r['source'] as String?) ?? 'product',
+                purchaseDate: DateTime.parse(r['purchase_date']),
+                createdAt: DateTime.parse(r['created_at']),
+                synced: true,
+              ))
+          .toList();
+      await LocalDbService.insertDealerPurchasesSynced(purchases);
     } catch (_) {}
 
     try {

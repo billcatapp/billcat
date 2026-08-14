@@ -5,6 +5,7 @@ import 'package:path/path.dart';
 import 'package:uuid/uuid.dart';
 import '../models/customer.dart';
 import '../models/dealer.dart';
+import '../models/dealer_purchase.dart';
 import '../models/product.dart';
 import '../models/transaction_record.dart';
 
@@ -39,7 +40,7 @@ class LocalDbService {
     final dbPath = await _appSupportPath();
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 17,
+      version: 18,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 4) {
           try { await db.execute('ALTER TABLE products ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
@@ -153,12 +154,35 @@ class LocalDbService {
             await db.execute('DROP TABLE _tx_old');
           } catch (_) {}
         }
+        if (oldVersion < 18) {
+          try { await db.execute(_dealerPurchasesDdl); } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
   }
 
+  /// Permanent per-purchase ledger for dealers. Shared by _createTables and the
+  /// v18 migration so a fresh install and an upgrade get an identical table.
+  static const String _dealerPurchasesDdl = '''
+      CREATE TABLE IF NOT EXISTS dealer_purchases (
+        id TEXT PRIMARY KEY,
+        dealer_id TEXT NOT NULL,
+        dealer_name TEXT NOT NULL DEFAULT '',
+        product_id TEXT NOT NULL DEFAULT '',
+        product_name TEXT NOT NULL DEFAULT '',
+        qty INTEGER NOT NULL DEFAULT 0,
+        unit_cost REAL NOT NULL DEFAULT 0,
+        amount REAL NOT NULL DEFAULT 0,
+        source TEXT NOT NULL DEFAULT 'product',
+        purchase_date TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        synced INTEGER NOT NULL DEFAULT 0
+      )
+    ''';
+
   static Future<void> _createTables(Database db) async {
+    await db.execute(_dealerPurchasesDdl);
     await db.execute('''
       CREATE TABLE products (
         id TEXT PRIMARY KEY,
@@ -759,6 +783,57 @@ class LocalDbService {
       'UPDATE dealers SET balance_payable = balance_payable - ?, synced = 0 WHERE id = ?',
       [amount, id],
     );
+  }
+
+  // ── Dealer purchase ledger ─────────────────────────────────────────────────
+
+  /// Appends a purchase line. Never updates an existing row: buying the same
+  /// product again must add to the history, not replace what came before.
+  static Future<void> insertDealerPurchase(DealerPurchase p) async {
+    final database = await db;
+    final map = p.toMap();
+    map['synced'] = 0;
+    await database.insert('dealer_purchases', map,
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// Purchase history for one dealer, newest first.
+  static Future<List<DealerPurchase>> getDealerPurchases(String dealerId) async {
+    final database = await db;
+    final rows = await database.query('dealer_purchases',
+        where: 'dealer_id = ?', whereArgs: [dealerId], orderBy: 'purchase_date DESC');
+    return rows.map(DealerPurchase.fromMap).toList();
+  }
+
+  static Future<void> deleteDealerPurchasesFor(String dealerId) async {
+    final database = await db;
+    await database
+        .delete('dealer_purchases', where: 'dealer_id = ?', whereArgs: [dealerId]);
+  }
+
+  static Future<List<DealerPurchase>> getUnsyncedDealerPurchases() async {
+    final database = await db;
+    final rows = await database
+        .query('dealer_purchases', where: 'synced = ?', whereArgs: [0]);
+    return rows.map(DealerPurchase.fromMap).toList();
+  }
+
+  static Future<void> markDealerPurchaseSynced(String id) async {
+    final database = await db;
+    await database
+        .update('dealer_purchases', {'synced': 1}, where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<void> insertDealerPurchasesSynced(List<DealerPurchase> items) async {
+    final database = await db;
+    final batch = database.batch();
+    for (final p in items) {
+      final map = p.toMap();
+      map['synced'] = 1;
+      batch.insert('dealer_purchases', map,
+          conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    await batch.commit(noResult: true);
   }
 
   static Future<List<Dealer>> getUnsyncedDealers() async {

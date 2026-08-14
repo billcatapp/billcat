@@ -215,51 +215,87 @@ class LabelPrinterService {
   /// of 95 modules, so its printed size is exact — never estimated.
   static bool _isEan13(String value) => RegExp(r'^\d{12,13}$').hasMatch(value);
 
-  static const int _ean13Modules = 95;
+  static const int _ean13Modules = 95; // fixed by the standard
+  static const int _ean13QuietModules = 18; // 11 leading + 7 trailing
+  static const int _code128QuietModules = 20; // 10 each side
+  static const int _minModuleDots = 2; // below this nothing scans reliably
+  static const int _maxModuleDots = 4;
 
-  /// Approximate printed width of a Code 128 barcode in dots. Conservative
-  /// per-character estimate — printer firmwares differ in how they pack
+  /// Module count of the symbol itself, quiet zones excluded. Code 128 is a
+  /// conservative per-character estimate — firmwares differ in how they pack
   /// digits, so never assume subset-C compression.
-  static int _code128Dots(String value, int narrow) =>
-      (11 * value.length + 35) * narrow;
+  static int _symbolModules(String value) =>
+      _isEan13(value) ? _ean13Modules : 11 * value.length + 35;
 
-  /// Largest narrow-module width (3 → 2 → 1) whose barcode fits [availDots]:
-  /// the boldest bars the sticker allows. 1 dot (0.125mm at 203dpi) is the
-  /// readable minimum for direct thermal.
-  static int _fitNarrow(String value, int availDots) {
-    for (var n = 3; n > 1; n--) {
-      if (_code128Dots(value, n) <= availDots) return n;
+  static int _quietModules(String value) =>
+      _isEan13(value) ? _ean13QuietModules : _code128QuietModules;
+
+  /// Widest whole-dot module that keeps the symbol AND its quiet zones inside
+  /// one sticker. Whole dots only: a thermal head cannot print a fraction.
+  /// Sizing against symbol+quiet means simply centring the symbol afterwards
+  /// leaves a legal quiet zone on both sides, with no fixed margin to guess.
+  static int _moduleDots(String value, int colWDots) {
+    final fit = colWDots ~/ (_symbolModules(value) + _quietModules(value));
+    if (fit < _minModuleDots) return _minModuleDots;
+    if (fit > _maxModuleDots) return _maxModuleDots;
+    return fit;
+  }
+
+  /// Narrowest sticker (mm) that prints [value] at a comfortably scannable
+  /// module width — what to tell the user to buy when their stock is too small.
+  static double minLabelWidthMm(String value, int dpi, {int moduleDots = 3}) =>
+      (_symbolModules(value) + _quietModules(value)) * moduleDots * 25.4 / dpi;
+
+  /// Null when every item prints at a reliably scannable size on [spec];
+  /// otherwise a message naming the narrowest stock that would work.
+  static String? fitWarning(List<LabelItem> items, LabelSpec spec, int dpi) {
+    final colWDots = _dots(spec.labelWmm, dpi);
+    var needed = 0.0;
+    for (final it in items) {
+      final v = _clean(it.barcodeValue);
+      if (v.isEmpty) continue;
+      if (_moduleDots(v, colWDots) >= 3) continue; // comfortably in spec
+      final need = minLabelWidthMm(v, dpi);
+      if (need > needed) needed = need;
     }
-    return 1;
+    if (needed == 0) return null;
+    return '${spec.labelWmm.toStringAsFixed(0)}mm stickers are too narrow for a '
+        'reliably scannable barcode — use ${needed.ceil()}mm or wider.';
   }
 
   static String buildTspl(List<LabelItem> items, LabelSpec spec, int dpi) {
     final flat = _flatten(items);
     final b = StringBuffer();
-    // Stickers sit side by side with the same gap BETWEEN columns as between
-    // rows: the column pitch must include it, or every sticker off-center
-    // drifts a little more (only the middle one looks aligned).
-    final fullW =
-        (spec.labelWmm * spec.columns + spec.gapMm * (spec.columns - 1))
-            .toStringAsFixed(1);
+    // Paper width is DERIVED, never typed: one sticker's width × how many sit
+    // across the liner. 30mm × 3 = 90mm. Columns therefore sit at an exact
+    // pitch of one sticker width and content is centred inside its own
+    // sticker, so nothing drifts as you move across the row.
+    final fullW = spec.fullWidthMm.toStringAsFixed(1);
     final labelH = spec.labelHmm.toStringAsFixed(1);
+    // GAP is the VERTICAL gap between rows — what the printer's sensor looks
+    // for as paper feeds. It plays no part in the width.
     final gap = spec.gapMm.toStringAsFixed(1);
 
     final colWDots = _dots(spec.labelWmm, dpi);
-    final colPitch = _dots(spec.labelWmm + spec.gapMm, dpi);
-    final margin = _dots(2.0, dpi); // quiet zone kept clear on BOTH sides
-    final availW = colWDots - margin * 2;
-    final barH = _dots(spec.labelHmm * 0.55, dpi).clamp(20, 100000);
-    // Center the whole block (barcode + two text lines) vertically so the
-    // top and bottom margins match — "placed perfect" on every sticker.
+    final colPitch = colWDots;
     final labelHDots = _dots(spec.labelHmm, dpi);
-    final lineGap = _dots(1.0, dpi);
-    final priceDrop = (dpi ~/ 12) + 14;
+
+    // Vertical stack: barcode, name, price. Reserve the two text lines FIRST
+    // so they can never be pushed off the sticker or printed over each other;
+    // whatever height is left goes to the bars.
     const textH = 24; // TSPL font "1" line height incl. breathing room
-    final contentH = barH + lineGap + priceDrop + textH;
-    final yBar = ((labelHDots - contentH) ~/ 2).clamp(_dots(1.0, dpi), labelHDots);
+    final lineGap = _dots(0.8, dpi);
+    final pad = _dots(0.8, dpi);
+    final maxBarH = labelHDots - (2 * textH + 2 * lineGap + 2 * pad);
+    final minBarH = _dots(3.0, dpi);
+    var barH = _dots(spec.labelHmm * 0.55, dpi);
+    if (barH > maxBarH) barH = maxBarH;
+    if (barH < minBarH) barH = minBarH;
+    final contentH = barH + lineGap + textH + lineGap + textH;
+    var yBar = (labelHDots - contentH) ~/ 2;
+    if (yBar < pad) yBar = pad;
     final yName = yBar + barH + lineGap;
-    final yPrice = yName + priceDrop;
+    final yPrice = yName + textH + lineGap;
     const charW = 8; // TSPL font "1" character width in dots
 
     b.writeln('SIZE $fullW mm,$labelH mm');
@@ -275,39 +311,30 @@ class LabelPrinterService {
         final colStart = (i - start) * colPitch;
         final val = _clean(it.barcodeValue);
         if (val.isEmpty) continue;
-        // Auto-fit: pick the boldest bars that keep the barcode inside its
-        // own sticker, then center it — bars must never cross a neighbour.
-        // EAN-13 values use the native type: exactly 95 modules wide, so
-        // the printed width is known, not estimated.
+        // Size the module so symbol + quiet zones fit one sticker, then centre
+        // the symbol: the leftover splits evenly into the quiet zones, and the
+        // bars can never reach the die cut or cross into a neighbour.
+        final module = _moduleDots(val, colWDots);
+        final barW = _symbolModules(val) * module;
+        final xBar = colStart + (colWDots - barW) ~/ 2;
         if (_isEan13(val)) {
           final v12 = val.substring(0, 12); // printer computes check digit
-          var narrow = 3;
-          while (narrow > 1 && _ean13Modules * narrow > availW) narrow--;
-          final barW = _ean13Modules * narrow;
-          final xBar =
-              colStart + ((colWDots - barW) ~/ 2).clamp(margin, colWDots);
           b.writeln(
-              'BARCODE $xBar,$yBar,"EAN13",$barH,0,0,$narrow,$narrow,"$v12"');
+              'BARCODE $xBar,$yBar,"EAN13",$barH,0,0,$module,$module,"$v12"');
         } else {
-          final narrow = _fitNarrow(val, availW);
-          final barW = _code128Dots(val, narrow);
-          final xBar =
-              colStart + ((colWDots - barW) ~/ 2).clamp(margin, colWDots);
           // BARCODE x,y,"type",height,human,rotation,narrow,wide,"content"
           b.writeln(
-              'BARCODE $xBar,$yBar,"128",$barH,0,0,$narrow,$narrow,"$val"');
+              'BARCODE $xBar,$yBar,"128",$barH,0,0,$module,$module,"$val"');
         }
-        final maxChars = availW ~/ charW;
+        final maxChars = colWDots ~/ charW;
         final name = _truncate(_clean(it.name), maxChars);
         final price = _truncate(_clean(it.price), maxChars);
         if (name.isNotEmpty) {
-          final xn = colStart +
-              ((colWDots - name.length * charW) ~/ 2).clamp(margin, colWDots);
+          final xn = colStart + (colWDots - name.length * charW) ~/ 2;
           b.writeln('TEXT $xn,$yName,"1",0,1,1,"$name"');
         }
         if (price.isNotEmpty) {
-          final xp = colStart +
-              ((colWDots - price.length * charW) ~/ 2).clamp(margin, colWDots);
+          final xp = colStart + (colWDots - price.length * charW) ~/ 2;
           b.writeln('TEXT $xp,$yPrice,"1",0,1,1,"$price"');
         }
       }
@@ -322,24 +349,27 @@ class LabelPrinterService {
   static String buildZpl(List<LabelItem> items, LabelSpec spec, int dpi) {
     final flat = _flatten(items);
     final b = StringBuffer();
-    final fullWDots = _dots(
-        spec.labelWmm * spec.columns + spec.gapMm * (spec.columns - 1), dpi);
+    // Same derived geometry as the TSPL builder: paper width is one sticker
+    // width × columns, so the column pitch is exactly one sticker.
+    final fullWDots = _dots(spec.fullWidthMm, dpi);
     final labelHDots = _dots(spec.labelHmm, dpi);
     final colWDots = _dots(spec.labelWmm, dpi);
-    final colPitch = _dots(spec.labelWmm + spec.gapMm, dpi);
-    final padX = _dots(2.0, dpi);
-    final barH = _dots(spec.labelHmm * 0.55, dpi).clamp(20, 100000);
-    // Vertically centered content block, matching the TSPL builder.
-    final lineGap = _dots(1.0, dpi);
-    const zplTextH = 22;
-    final contentH = barH + lineGap + 22 + zplTextH;
-    final yBar =
-        ((labelHDots - contentH) ~/ 2).clamp(_dots(1.0, dpi), labelHDots);
-    final yName = yBar + barH + lineGap;
-    final yPrice = yName + 22;
+    final colPitch = colWDots;
 
-    final margin = padX;
-    final availW = colWDots - margin * 2;
+    const zplTextH = 22;
+    final lineGap = _dots(0.8, dpi);
+    final pad = _dots(0.8, dpi);
+    final maxBarH = labelHDots - (2 * zplTextH + 2 * lineGap + 2 * pad);
+    final minBarH = _dots(3.0, dpi);
+    var barH = _dots(spec.labelHmm * 0.55, dpi);
+    if (barH > maxBarH) barH = maxBarH;
+    if (barH < minBarH) barH = minBarH;
+    final contentH = barH + lineGap + zplTextH + lineGap + zplTextH;
+    var yBar = (labelHDots - contentH) ~/ 2;
+    if (yBar < pad) yBar = pad;
+    final yName = yBar + barH + lineGap;
+    final yPrice = yName + zplTextH + lineGap;
+
     const zplCharW = 10; // ^A0N,18,18 approx character width in dots
 
     for (var start = 0; start < flat.length; start += spec.columns) {
@@ -352,32 +382,24 @@ class LabelPrinterService {
         final colStart = (i - start) * colPitch;
         final val = _clean(it.barcodeValue);
         if (val.isEmpty) continue;
+        final module = _moduleDots(val, colWDots);
+        final barW = _symbolModules(val) * module;
+        final xBar = colStart + (colWDots - barW) ~/ 2;
         if (_isEan13(val)) {
           final v12 = val.substring(0, 12); // printer computes check digit
-          var narrow = 3;
-          while (narrow > 1 && _ean13Modules * narrow > availW) narrow--;
-          final barW = _ean13Modules * narrow;
-          final xBar =
-              colStart + ((colWDots - barW) ~/ 2).clamp(margin, colWDots);
-          b.writeln('^FO$xBar,$yBar^BY$narrow^BEN,$barH,N,N^FD$v12^FS');
+          b.writeln('^FO$xBar,$yBar^BY$module^BEN,$barH,N,N^FD$v12^FS');
         } else {
-          final narrow = _fitNarrow(val, availW);
-          final barW = _code128Dots(val, narrow);
-          final xBar =
-              colStart + ((colWDots - barW) ~/ 2).clamp(margin, colWDots);
-          b.writeln('^FO$xBar,$yBar^BY$narrow^BCN,$barH,N,N,N^FD$val^FS');
+          b.writeln('^FO$xBar,$yBar^BY$module^BCN,$barH,N,N,N^FD$val^FS');
         }
-        final maxChars = availW ~/ zplCharW;
+        final maxChars = colWDots ~/ zplCharW;
         final name = _truncate(_clean(it.name), maxChars);
         final price = _truncate(_clean(it.price), maxChars);
         if (name.isNotEmpty) {
-          final xn = colStart +
-              ((colWDots - name.length * zplCharW) ~/ 2).clamp(margin, colWDots);
+          final xn = colStart + (colWDots - name.length * zplCharW) ~/ 2;
           b.writeln('^FO$xn,$yName^A0N,18,18^FD$name^FS');
         }
         if (price.isNotEmpty) {
-          final xp = colStart +
-              ((colWDots - price.length * zplCharW) ~/ 2).clamp(margin, colWDots);
+          final xp = colStart + (colWDots - price.length * zplCharW) ~/ 2;
           b.writeln('^FO$xp,$yPrice^A0N,18,18^FD$price^FS');
         }
       }

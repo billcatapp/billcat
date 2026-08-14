@@ -14,6 +14,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../constants/app_colors.dart';
 import '../../models/customer.dart';
 import '../../models/dealer.dart';
+import '../../models/dealer_purchase.dart';
 import '../../models/product.dart';
 import '../../models/transaction_record.dart';
 import '../../providers/cart_provider.dart';
@@ -316,6 +317,8 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // Focuses the VARIANT box so a freshly added variant can be renamed in place.
   final FocusNode _variantNameFocus = FocusNode();
+  // The variant name shows as plain text until tapped; this flips it to a field.
+  bool _variantNameEditing = false;
 
   // Product whose variants are currently expanded inline in the billing grid.
   String? _expandedVariantProductId;
@@ -1344,6 +1347,22 @@ class _BillingScreenState extends State<BillingScreen> {
     final custNameCtrl = TextEditingController();
     final custPhoneCtrl = TextEditingController();
     final scanFocus = FocusNode();
+    // Keep the scan box hot exactly like the Billing screen does (see
+    // _keepSearchFocusedWhenIdle): the moment focus falls to nothing, take it
+    // back so the dialog is always waiting for a scanner. Never steal from a
+    // field the user is actually typing in, nor from the browse picker — both
+    // hold primary focus themselves.
+    void keepScanFocusedWhenIdle() {
+      if (scanFocus.hasFocus) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || scanFocus.context == null) return;
+        final pf = FocusManager.instance.primaryFocus;
+        final somethingElseFocused =
+            pf != null && pf.hasPrimaryFocus && pf != scanFocus;
+        if (!somethingElseFocused) scanFocus.requestFocus();
+      });
+    }
+    scanFocus.addListener(keepScanFocusedWhenIdle);
     double creditSettled = 0;
     var topUpMethod = 'cash'; // how a COLLECT difference was paid
     TransactionRecord? bill;
@@ -1511,17 +1530,27 @@ class _BillingScreenState extends State<BillingScreen> {
               )
                 ..productId = p.id
                 ..variantIdRef = v?.id));
+          // Put the cursor back in the scan box so the next barcode just works
+          // — including after the browse picker closes.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (scanFocus.context != null) scanFocus.requestFocus();
+          });
         }
 
         // Barcode scanners type the code and press Enter — exact barcode
         // match adds instantly; a unique name match adds too; anything
         // ambiguous opens the picker pre-filtered by hand.
         void scanAdd(String raw) {
-          final s = raw.trim().toLowerCase();
+          final q = raw.trim();
+          final s = q.toLowerCase();
           scanCtrl.clear();
-          if (s.isEmpty) return;
+          if (q.isEmpty) return;
+          // Use the SAME tolerant matcher the Billing scan uses. A scanner
+          // sends the full 13-digit EAN-13 (or a UPC-A with the leading zero
+          // stripped) while the stored value is the 12-digit input, so plain
+          // equality missed every real scan and fell through to the picker.
           for (final p in _products) {
-            if (p.barcodeNo.toLowerCase() == s) {
+            if (_barcodeMatches(p.barcodeNo, q)) {
               // Variant products carry stock/price per variant: adding the
               // base product would price it wrongly and move the wrong stock.
               if (p.variants.isNotEmpty) {
@@ -1532,10 +1561,21 @@ class _BillingScreenState extends State<BillingScreen> {
               return;
             }
             for (final v in p.variants) {
-              if (v.barcodeNo.toLowerCase() == s) {
+              if (_barcodeMatches(v.barcodeNo, q)) {
                 addExchange(p, v);
                 return;
               }
+            }
+          }
+          // Then SKU, mirroring the Billing search box.
+          for (final p in _products) {
+            if (p.sku.toLowerCase() == s) {
+              if (p.variants.isNotEmpty) {
+                _pickProductForReturn(ctx, addExchange);
+                return;
+              }
+              addExchange(p, null);
+              return;
             }
           }
           final byName = _products
@@ -1699,6 +1739,13 @@ class _BillingScreenState extends State<BillingScreen> {
                                   error = null;
                                   custNameCtrl.text = target!.customerName ?? '';
                                   custPhoneCtrl.text = target.customerPhone ?? '';
+                                });
+                                // Bill chosen → the dialog is ready to scan.
+                                WidgetsBinding.instance
+                                    .addPostFrameCallback((_) {
+                                  if (scanFocus.context != null) {
+                                    scanFocus.requestFocus();
+                                  }
                                 });
                               },
                               borderRadius: BorderRadius.circular(10),
@@ -1941,6 +1988,40 @@ class _BillingScreenState extends State<BillingScreen> {
                     TextField(
                       controller: scanCtrl,
                       focusNode: scanFocus,
+                      // A scanner types into whatever holds focus. Once a bill
+                      // is chosen the bill-search box is gone, so without this
+                      // nothing is focused and the whole scan is dropped.
+                      autofocus: true,
+                      // A scanner gun types the code and sends NO Enter, so
+                      // matching only on submit never fired. The Billing search
+                      // box matches on every keystroke and adds the moment one
+                      // lands — do the same here. Enter still works below for
+                      // typed searches and name lookups.
+                      onChanged: (v) {
+                        final query = v.trim();
+                        if (query.isEmpty) return;
+                        for (final p in _products) {
+                          if (_barcodeMatches(p.barcodeNo, query) ||
+                              p.sku.toLowerCase() == query.toLowerCase()) {
+                            scanCtrl.clear();
+                            // Variants price and stock separately, so the base
+                            // product must never be added on its own.
+                            if (p.variants.isNotEmpty) {
+                              _pickProductForReturn(ctx, addExchange);
+                            } else {
+                              addExchange(p, null);
+                            }
+                            return;
+                          }
+                          for (final vr in p.variants) {
+                            if (_barcodeMatches(vr.barcodeNo, query)) {
+                              scanCtrl.clear();
+                              addExchange(p, vr);
+                              return;
+                            }
+                          }
+                        }
+                      },
                       onSubmitted: scanAdd,
                       style: GoogleFonts.inter(fontSize: 13),
                       decoration: InputDecoration(
@@ -8873,9 +8954,13 @@ end tell
           ),
       ];
       final spec = LabelSpec(labelWmm: labelW, labelHmm: labelH, columns: labelsPerRow, gapMm: _barcodeGapMm);
+      // Better a warning than a roll of labels that won't scan at the counter.
+      final warn = LabelPrinterService.fitWarning(items, spec, profile.dpi);
       try {
         await LabelPrinterService.printBatch(items, spec, profile);
-        if (mounted) _showToast('Sent to $dest');
+        if (mounted) {
+          _showToast(warn == null ? 'Sent to $dest' : 'Sent to $dest — $warn');
+        }
       } catch (e) {
         if (mounted) _showToast('Printer $dest failed: $e', isError: true);
       }
@@ -8893,13 +8978,16 @@ end tell
     // that is the real liner width (e.g. 3 × 35mm + 2 × 2mm = 109mm). Assuming
     // zero gap makes every column after the first land short of its sticker,
     // and the error accumulates across the row.
-    final gapMm = _barcodeGapMm;
+    // Paper width is derived from the stock, not typed: one sticker's width ×
+    // how many sit across. 30mm × 3 = 90mm. Gap is the VERTICAL gap between
+    // rows (the printer's sensor mark) and takes no part in the width.
+    const gapMm = 0.0;
     const marginMm = 0.0;
     final gap = gapMm * PdfPageFormat.mm;
     final margin = marginMm * PdfPageFormat.mm;
     final cellW = labelW * PdfPageFormat.mm;
     final cellH = labelH * PdfPageFormat.mm;
-    final pageW = margin * 2 + labelsPerRow * cellW + (labelsPerRow - 1) * gap;
+    final pageW = labelsPerRow * cellW;
     final pageH = cellH;
     final pageFormat = PdfPageFormat(pageW, pageH);
     final pad = 0.5 * PdfPageFormat.mm;
@@ -8915,7 +9003,10 @@ end tell
       } catch (_) {
         svgStr = bc.Barcode.code128().toSvg(barcodeVal, width: 200, height: 80, drawText: false);
       }
-      final innerPad = 5.0 * PdfPageFormat.mm;
+      // Quiet zone scaled to the sticker instead of a flat 5mm, which ate a
+      // third of a 30mm label and left the bars too fine to scan.
+      final innerPad =
+          (cellW * 0.06).clamp(1.5 * PdfPageFormat.mm, 4.0 * PdfPageFormat.mm);
       pw.Widget labelCell() => pw.Container(
         width: cellW, height: cellH,
         padding: pw.EdgeInsets.symmetric(horizontal: innerPad, vertical: 1.5 * PdfPageFormat.mm),
@@ -9313,12 +9404,27 @@ end tell
     );
   }
 
+  /// Price shown on an inventory card. A product whose pricing lives on its
+  /// variants keeps price 0 on the base row, so showing p.price would read
+  /// "₹0.00" for a perfectly priced product — show the variants' range instead.
+  /// Display only: no stored price is read differently or changed anywhere else.
+  String _cardPriceLabel(Product p) {
+    if (p.price > 0 || p.variants.isEmpty) return _fmtComma(p.price);
+    final prices = p.variants.map((v) => v.price).where((x) => x > 0).toList()..sort();
+    if (prices.isEmpty) return _fmtComma(p.price);
+    if (prices.first == prices.last) return _fmtComma(prices.first);
+    return '${_fmtComma(prices.first)} – ${_fmtComma(prices.last)}';
+  }
+
   Widget _inventoryCard(Product p) {
-    final (statusLabel, statusColor, statusBg) = p.stock == 0
-        ? ('Out of Stock', AppColors.error, AppColors.error.withValues(alpha: 0.08))
+    // The badge carries the stock count itself, shaded by status: red = out,
+    // amber = low, green = healthy. Same thresholds as before.
+    final statusLabel = '${p.stock} ${p.unit}';
+    final (statusColor, statusBg) = p.stock == 0
+        ? (AppColors.error, AppColors.error.withValues(alpha: 0.12))
         : p.stock < 10
-            ? ('Low Stock', const Color(0xFFF59E0B), const Color(0xFFF59E0B).withValues(alpha: 0.08))
-            : ('In Stock', AppColors.success, AppColors.success.withValues(alpha: 0.08));
+            ? (const Color(0xFFF59E0B), const Color(0xFFF59E0B).withValues(alpha: 0.12))
+            : (AppColors.success, AppColors.success.withValues(alpha: 0.12));
     final topRank = _topProductsToday.indexWhere((t) => t.$1 == p.name);
     final topMedal = topRank == 0 ? '🥇' : topRank == 1 ? '🥈' : topRank == 2 ? '🥉' : null;
 
@@ -9391,7 +9497,7 @@ end tell
               decoration: BoxDecoration(
                   color: statusBg, borderRadius: BorderRadius.circular(100)),
               child: Text(statusLabel, style: GoogleFonts.inter(
-                  fontSize: 9, fontWeight: FontWeight.w700,
+                  fontSize: 10, fontWeight: FontWeight.w700,
                   color: statusColor, letterSpacing: 0.2)),
             ),
             if (topMedal != null) ...[
@@ -9431,15 +9537,20 @@ end tell
             ),
           ]),
           const SizedBox(height: 10),
-          Row(children: [
-            Text('$_currencySymbol${p.price.toStringAsFixed(2)}',
-                style: GoogleFonts.manrope(fontSize: 14,
-                    fontWeight: FontWeight.w800, color: AppColors.textDark)),
-            const Spacer(),
-            Text('${p.stock} ${p.unit}', style: GoogleFonts.inter(
-                fontSize: 11, fontWeight: FontWeight.w600,
-                color: p.stock < 10 ? AppColors.error : AppColors.textMuted)),
-          ]),
+          // Full amount across the whole card width — the stock count moved up
+          // into the status badge, so nothing competes for room here. FittedBox
+          // shrinks the text rather than ellipsising it, so the price is never
+          // cut off.
+          Align(
+            alignment: Alignment.centerLeft,
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(_cardPriceLabel(p), maxLines: 1,
+                  style: GoogleFonts.manrope(fontSize: 14,
+                      fontWeight: FontWeight.w800, color: AppColors.textDark)),
+            ),
+          ),
         ],
       ),
     );
@@ -9600,6 +9711,18 @@ end tell
                   const SizedBox(width: 10),
                   Expanded(child: _field('Gap (mm)', gapCtrl)),
                 ]),
+                const SizedBox(height: 8),
+                // Paper width is derived, never typed: width × per row.
+                Builder(builder: (_) {
+                  final w = double.tryParse(labelWCtrl.text) ?? _barcodeLabelW;
+                  final n = int.tryParse(perRowCtrl.text) ?? labelsPerRow;
+                  final total = w * n;
+                  return Text(
+                    'Paper width: ${w.toStringAsFixed(w == w.truncateToDouble() ? 0 : 1)}mm × $n '
+                    '= ${total.toStringAsFixed(total == total.truncateToDouble() ? 0 : 1)}mm',
+                    style: GoogleFonts.inter(fontSize: 11, color: AppColors.textMuted),
+                  );
+                }),
                 const SizedBox(height: 14),
                 // Printer — styled like a segmented/filled selector
                 Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -9725,17 +9848,22 @@ end tell
     final doc = pw.Document();
     // labelW x labelH = ONE sticker; the page is perRow stickers PLUS the
     // die-cut gaps between them, which is the real liner width.
-    final gapMm = _barcodeGapMm;
+    // Paper width is derived from the stock, not typed: one sticker's width ×
+    // how many sit across. 30mm × 3 = 90mm. Gap is the VERTICAL gap between
+    // rows (the printer's sensor mark) and takes no part in the width.
+    const gapMm = 0.0;
     const marginMm = 0.0;
     final gap = gapMm * PdfPageFormat.mm;
     final margin = marginMm * PdfPageFormat.mm;
     final cellW = labelW * PdfPageFormat.mm;
     final cellH = labelH * PdfPageFormat.mm;
-    final pageW = margin * 2 + labelsPerRow * cellW + (labelsPerRow - 1) * gap;
+    final pageW = labelsPerRow * cellW;
     final pageH = cellH;
     final pageFormat = PdfPageFormat(pageW, pageH);
 
-    final pad = 5.0 * PdfPageFormat.mm;
+    // Quiet zone scaled to the sticker (see the bulk print path).
+    final pad =
+        (cellW * 0.06).clamp(1.5 * PdfPageFormat.mm, 4.0 * PdfPageFormat.mm);
     pw.Widget labelCell() => pw.Container(
       width: cellW,
       height: cellH,
@@ -10044,6 +10172,7 @@ end tell
     void addVariant() {
       setLocal(() {
         drafts.add(_VariantDraft());
+        _variantNameEditing = true; // a brand-new variant opens ready to type
         onSelect(drafts.length - 1);
       });
       // Focus the box so the user types the new variant's name right here.
@@ -10060,6 +10189,7 @@ end tell
         if (v == -2) {
           addVariant();
         } else {
+          _variantNameEditing = false; // switching variants leaves edit mode
           onSelect(v);
         }
       },
@@ -10078,21 +10208,72 @@ end tell
     );
 
     if (variantSelected) {
-      // Editable name — typing renames the selected variant live.
-      return TextField(
-        controller: drafts[selVar].name,
-        focusNode: _variantNameFocus,
-        style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
-        onChanged: (_) => setLocal(() {}),
-        decoration: _dlgInputDecor('Variant ${selVar + 1}').copyWith(
-          // Pencil hints that the name is editable in place.
-          prefixIcon: const Padding(
-            padding: EdgeInsets.only(left: 10, right: 4),
-            child: Icon(Icons.edit_rounded, size: 13, color: AppColors.textMuted),
+      final nameCtrl = drafts[selVar].name;
+      final placeholder = 'Variant ${selVar + 1}';
+
+      // "+" adds another variant without going through the ▾ menu.
+      Widget addBtn() => Padding(
+        padding: const EdgeInsets.only(left: 8, right: 2),
+        child: InkWell(
+          onTap: addVariant,
+          borderRadius: BorderRadius.circular(6),
+          child: const Padding(
+            padding: EdgeInsets.all(3),
+            child: Icon(Icons.add_rounded, size: 16, color: AppColors.accentBlue),
           ),
+        ),
+      );
+
+      if (_variantNameEditing) {
+        // Typing renames the selected variant live.
+        return TextField(
+          controller: nameCtrl,
+          focusNode: _variantNameFocus,
+          style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+          onChanged: (_) => setLocal(() {}),
+          onSubmitted: (_) => setLocal(() => _variantNameEditing = false),
+          onTapOutside: (_) {
+            if (_variantNameEditing) setLocal(() => _variantNameEditing = false);
+          },
+          decoration: _dlgInputDecor(placeholder).copyWith(
+            prefixIcon: addBtn(),
+            prefixIconConstraints: const BoxConstraints(minWidth: 0, minHeight: 0),
+            suffixIcon: variantsMenu(),
+            suffixIconConstraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+          ),
+        );
+      }
+
+      // Rest state: plain text. Tapping the name switches to editing.
+      final shown = nameCtrl.text.trim();
+      return InputDecorator(
+        decoration: _dlgInputDecor('').copyWith(
+          prefixIcon: addBtn(),
           prefixIconConstraints: const BoxConstraints(minWidth: 0, minHeight: 0),
           suffixIcon: variantsMenu(),
           suffixIconConstraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+        ),
+        child: InkWell(
+          onTap: () {
+            setLocal(() => _variantNameEditing = true);
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _variantNameFocus.requestFocus();
+              // Select all so a rename can just be typed over.
+              nameCtrl.selection = TextSelection(
+                  baseOffset: 0, extentOffset: nameCtrl.text.length);
+            });
+          },
+          child: SizedBox(
+            width: double.infinity,
+            child: Text(
+              shown.isEmpty ? placeholder : shown,
+              overflow: TextOverflow.ellipsis,
+              style: GoogleFonts.inter(
+                fontSize: 13,
+                color: shown.isEmpty ? AppColors.textMuted : AppColors.textDark,
+              ),
+            ),
+          ),
         ),
       );
     }
@@ -10287,6 +10468,7 @@ end tell
     // Show the first saved variant on open so existing variants are visible
     // (there's no "Default" row now); -1 = base product when there are none.
     int selVar = variantDrafts.isNotEmpty ? 0 : -1;
+    _variantNameEditing = false; // every open starts in read mode
 
     showDialog(
       context: context,
@@ -10714,6 +10896,7 @@ end tell
     bool skuAutoMode = true;
     final variantDrafts = <_VariantDraft>[];
     int selVar = -1; // -1 = base product; else index into variantDrafts
+    _variantNameEditing = false; // every open starts in read mode
     // Explicit focus chain so Enter walks only the text fields (skips dropdowns,
     // the date picker and the action buttons).
     final nameFocus = FocusNode();
@@ -10777,6 +10960,7 @@ end tell
             variants: variants,
           );
           await LocalDbService.insertProduct(newProduct);
+          await _recordProductPurchase(newProduct);
           ConnectivityService.instance.syncNow();
           if (!ctx.mounted) return;
           setState(() => _products.add(newProduct));
@@ -13310,6 +13494,38 @@ end tell
 
   // ── Dealers: add / detail / persistence ────────────────────────────────────
 
+  /// Records stock bought in on Add Product as a permanent ledger line and adds
+  /// it to that dealer's Total Purchased. Treated as paid in full, so the
+  /// payable balance is left alone. No-op when the supplier isn't a saved
+  /// dealer (e.g. a name typed before the dropdown existed) or nothing was
+  /// actually bought in.
+  Future<void> _recordProductPurchase(Product product) async {
+    final name = product.supplier.trim();
+    if (name.isEmpty || product.stock <= 0) return;
+    final matches = _reportDealers
+        .where((d) => d.name.toLowerCase() == name.toLowerCase())
+        .toList();
+    if (matches.isEmpty) return;
+    final dealer = matches.first;
+    final amount = product.buyingPrice * product.stock;
+    await LocalDbService.insertDealerPurchase(DealerPurchase(
+      id: const Uuid().v4(),
+      dealerId: dealer.id,
+      dealerName: dealer.name,
+      productId: product.id,
+      productName: product.name,
+      qty: product.stock,
+      unitCost: product.buyingPrice,
+      amount: amount,
+      source: 'product',
+      purchaseDate: product.purchaseDate ?? DateTime.now(),
+      createdAt: DateTime.now(),
+    ));
+    // paidNow == amount, so balance_payable moves by zero.
+    await LocalDbService.recordDealerPurchase(dealer.id, amount, amount);
+    await _loadReportDealers();
+  }
+
   Future<void> _saveDealerAndSync(Dealer d) async {
     await LocalDbService.saveDealer(d);
     ConnectivityService.instance.syncNow();
@@ -13318,6 +13534,8 @@ end tell
 
   Future<void> _deleteDealer(Dealer d) async {
     await LocalDbService.deleteDealer(d.id);
+    // Drop the dealer's ledger too, or its history outlives it and keeps syncing.
+    await LocalDbService.deleteDealerPurchasesFor(d.id);
     try {
       final userId = Supabase.instance.client.auth.currentUser?.id;
       if (userId != null) {
@@ -13325,6 +13543,11 @@ end tell
             .from('dealers')
             .delete()
             .eq('id', d.id)
+            .eq('user_id', userId);
+        await Supabase.instance.client
+            .from('dealer_purchases')
+            .delete()
+            .eq('dealer_id', d.id)
             .eq('user_id', userId);
       }
     } catch (_) {}
@@ -13508,6 +13731,76 @@ end tell
                   ),
                 )),
               ]),
+              const SizedBox(height: 20),
+              Text('PURCHASE HISTORY', style: GoogleFonts.inter(
+                  fontSize: 10, fontWeight: FontWeight.w600,
+                  color: AppColors.textMuted, letterSpacing: 1)),
+              const SizedBox(height: 8),
+              FutureBuilder<List<DealerPurchase>>(
+                future: LocalDbService.getDealerPurchases(d.id),
+                builder: (_, snap) {
+                  if (snap.connectionState != ConnectionState.done) {
+                    return const SizedBox(height: 56, child: Center(
+                      child: SizedBox(width: 18, height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2)),
+                    ));
+                  }
+                  final items = snap.data ?? const <DealerPurchase>[];
+                  if (items.isEmpty) {
+                    return Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(vertical: 18),
+                      decoration: BoxDecoration(
+                        color: AppColors.surface,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: AppColors.border),
+                      ),
+                      child: Text('No purchases recorded yet',
+                          textAlign: TextAlign.center,
+                          style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
+                    );
+                  }
+                  return ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 200),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      padding: EdgeInsets.zero,
+                      itemCount: items.length,
+                      separatorBuilder: (_, _) =>
+                          const Divider(height: 1, color: AppColors.border),
+                      itemBuilder: (_, i) {
+                        final p = items[i];
+                        final sub = [
+                          _fmtDate(p.purchaseDate),
+                          if (p.qty > 0) '${p.qty} × ${_fmtComma(p.unitCost)}',
+                          if (p.source == 'manual') 'manual entry',
+                        ].join(' · ');
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 9),
+                          child: Row(children: [
+                            Expanded(child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(p.productName.isEmpty ? 'Purchase' : p.productName,
+                                    maxLines: 1, overflow: TextOverflow.ellipsis,
+                                    style: GoogleFonts.inter(fontSize: 12.5,
+                                        fontWeight: FontWeight.w600, color: AppColors.textDark)),
+                                const SizedBox(height: 2),
+                                Text(sub, style: GoogleFonts.inter(
+                                    fontSize: 11, color: AppColors.textMuted)),
+                              ],
+                            )),
+                            const SizedBox(width: 10),
+                            Text(_fmtComma(p.amount), style: GoogleFonts.manrope(
+                                fontSize: 13, fontWeight: FontWeight.w700,
+                                color: AppColors.textDark)),
+                          ]),
+                        );
+                      },
+                    ),
+                  );
+                },
+              ),
               const SizedBox(height: 14),
               Center(child: TextButton.icon(
                 onPressed: () async {
@@ -13566,6 +13859,17 @@ end tell
                     final paid = (double.tryParse(paidCtrl.text) ?? 0).clamp(0, amount).toDouble();
                     Navigator.pop(ctx);
                     await LocalDbService.recordDealerPurchase(d.id, amount, paid);
+                    // Manual entries share the same ledger as Add Product ones
+                    // so the dealer's history is one continuous timeline.
+                    await LocalDbService.insertDealerPurchase(DealerPurchase(
+                      id: const Uuid().v4(),
+                      dealerId: d.id,
+                      dealerName: d.name,
+                      amount: amount,
+                      source: 'manual',
+                      purchaseDate: DateTime.now(),
+                      createdAt: DateTime.now(),
+                    ));
                     ConnectivityService.instance.syncNow();
                     await _loadReportDealers();
                   },
