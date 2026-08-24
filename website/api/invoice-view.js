@@ -1,11 +1,21 @@
 const SUPABASE_URL = 'https://xawpxbhglzhaibmcpwho.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhhd3B4YmhnbHpoYWlibWNwd2hvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcxMTA4MTMsImV4cCI6MjA5MjY4NjgxM30.rin8K6vTWF_L-gCJKw1dyf0Vm2RoDvxcMSKSnClWy9E';
 
+// Transactions are locked to their owner by RLS (auth.uid() = user_id), so an
+// anonymous read returns nothing and every shared bill link 404s. This runs
+// server-side on Vercel, so the service key can do the one lookup the customer
+// asked for. It is read from the environment and never reaches the browser —
+// do NOT move this into any client-side file.
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+// Falls back to anon so a missing env var degrades to today's behaviour
+// (a 404) rather than crashing the page.
+const READ_KEY = SUPABASE_SERVICE_KEY || SUPABASE_ANON_KEY;
+
 async function supabaseGet(path) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'apikey': READ_KEY,
+      'Authorization': `Bearer ${READ_KEY}`,
     },
   });
   if (!res.ok) return null;
@@ -199,6 +209,12 @@ tbody td.right{text-align:right}
 export default async function handler(req, res) {
   const slug = req.query.slug || req.query.uid;
   if (!slug) return res.status(400).send('Missing parameters');
+  // This handler now reads with the service key, which bypasses RLS. Pin the
+  // slug to the shape BillCat generates (uid + branch + bill, hex-ish) so it
+  // can only ever be used to fetch one invoice by its link token.
+  if (!/^[a-z0-9]{6,32}$/i.test(slug)) {
+    return res.status(404).send(notFoundHtml());
+  }
 
   try {
     // Direct lookup by site_link column — single exact match
