@@ -293,6 +293,9 @@ class _BillingScreenState extends State<BillingScreen> {
   String _receiptFooter = 'Thank you for your purchase!';
   String _taxLabel = 'GST';
   String _taxRateDisplay = '0';
+  // Master switch. Off => nothing is taxed and no tax line prints, but the
+  // saved rate is kept so turning it back on restores it.
+  bool _taxEnabled = true;
   String _currencySymbol = '₹';
   String _currencyCode = 'INR';
   String _dialCode = '+91'; // default India
@@ -411,6 +414,10 @@ class _BillingScreenState extends State<BillingScreen> {
   String _editBranchNumber = '01';
 
   // WhatsApp Meta Cloud API
+  // Off => open WhatsApp with a pre-filled message and the bill link (works
+  // for anyone, no Meta setup). On => send the PDF through the Cloud API,
+  // which needs a live token and a verified number.
+  bool _waUseApi = false;
   String _waPhoneNumberId = '';
   String _waAccessToken = '';
   String _editWaPhoneNumberId = '';
@@ -492,6 +499,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _receiptFooter = s['receipt_footer'] ?? _receiptFooter;
       _taxLabel = s['tax_label'] ?? _taxLabel;
       _taxRateDisplay = s['tax_rate'] ?? _taxRateDisplay;
+      _taxEnabled = (s['tax_enabled'] ?? '1') == '1';
       _currencyCode = s['currency_code'] ?? _currencyCode;
       _currencySymbol = s['currency_symbol'] ?? _currencySymbol;
       _dialCode = s['dial_code'] ?? _dialCode;
@@ -522,6 +530,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _branchNumber = s['branch_number'] ?? _branchNumber;
       _ownerPasscode    = s['owner_passcode'] ?? '';
       _ownerLockEnabled = (s['owner_lock_enabled'] ?? '0') == '1';
+      _waUseApi = (s['wa_use_api'] ?? '0') == '1';
       _waPhoneNumberId = s['wa_phone_number_id'] ?? '';
       _waAccessToken = s['wa_access_token'] ?? '';
       _editWaPhoneNumberId = _waPhoneNumberId;
@@ -568,7 +577,7 @@ class _BillingScreenState extends State<BillingScreen> {
 
   void _syncTaxRate() {
     final cart = context.read<CartProvider>();
-    cart.setTaxRate(double.tryParse(_taxRateDisplay) ?? 0.0);
+    cart.setTaxRate(_taxEnabled ? (double.tryParse(_taxRateDisplay) ?? 0.0) : 0.0);
   }
 
   Future<void> _loadSavedCustomers() async {
@@ -848,6 +857,7 @@ class _BillingScreenState extends State<BillingScreen> {
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleHardwareKey);
     _printSafetyTimer?.cancel();
+    _toastTimer?.cancel();
     ConnectivityService.instance.removeListener(_onSyncComplete);
     _searchController.dispose();
     _searchFocus.dispose();
@@ -874,15 +884,23 @@ class _BillingScreenState extends State<BillingScreen> {
     super.dispose();
   }
 
+  Timer? _toastTimer;
+
   void _showToast(String message, {bool isError = false}) {
     setState(() {
       _toastMessage = message;
       _toastIsError = isError;
       _toastVisible = true;
     });
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted) setState(() => _toastVisible = false);
-    });
+    // One timer, cancelled and restarted each time: separate delayed futures
+    // meant an earlier toast's timer hid a later one after a second or two,
+    // which is how real errors flashed past unread.
+    _toastTimer?.cancel();
+    _toastTimer = Timer(
+      // Errors carry the reason and need reading; successes can go quickly.
+      Duration(seconds: isError ? 7 : 3),
+      () { if (mounted) setState(() => _toastVisible = false); },
+    );
   }
 
   @override
@@ -3145,22 +3163,33 @@ class _BillingScreenState extends State<BillingScreen> {
       }
     }
 
+    final typedPrice = double.tryParse(_customPriceCtrl.text) ?? 0;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
       child: Row(
         children: [
-          // Name field (no SKU line)
+          // Name + a sub-line where a saved row shows its SKU, so the row
+          // reads the same as the products above it.
           Expanded(
-            child: TextField(
-              controller: _customNameCtrl,
-              focusNode: _customNameFocus,
-              maxLines: 1,
-              style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.primary),
-              decoration: InputDecoration.collapsed(
-                hintText: 'Item name',
-                hintStyle: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textMuted),
-              ),
-              onSubmitted: (_) => Future.microtask(() => _customPriceFocus.requestFocus()),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: _customNameCtrl,
+                  focusNode: _customNameFocus,
+                  maxLines: 1,
+                  style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.primary),
+                  decoration: InputDecoration.collapsed(
+                    hintText: 'Item name',
+                    hintStyle: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textMuted),
+                  ),
+                  onSubmitted: (_) => Future.microtask(() => _customPriceFocus.requestFocus()),
+                ),
+                const SizedBox(height: 2),
+                Text('SKU: CUSTOM',
+                    style: GoogleFonts.inter(fontSize: 10, fontWeight: FontWeight.w300,
+                        color: AppColors.textMuted.withValues(alpha: 0.6), letterSpacing: 0.5)),
+              ],
             ),
           ),
           const SizedBox(width: 8),
@@ -3202,7 +3231,8 @@ class _BillingScreenState extends State<BillingScreen> {
             ),
           ),
           const SizedBox(width: 8),
-          // Price field
+          // Price sits where a saved row shows its amount, with the line total
+          // underneath in place of the unit price.
           SizedBox(
             width: 82,
             child: Column(
@@ -3219,19 +3249,28 @@ class _BillingScreenState extends State<BillingScreen> {
                     hintText: '0.00',
                     hintStyle: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.textMuted),
                   ),
+                  onChanged: (_) => setState(() {}), // keep the total below live
+                  // No tick to press: entering the price and moving on adds it.
                   onSubmitted: (_) => confirm(),
+                  onTapOutside: (_) => confirm(),
                 ),
+                Text(
+                    typedPrice > 0
+                        ? '${fmtMoney(_currencySymbol, typedPrice * _customQty)} total'
+                        : 'enter price',
+                    style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted.withValues(alpha: 0.6), fontWeight: FontWeight.w300)),
               ],
             ),
           ),
           const SizedBox(width: 8),
           GestureDetector(
-            onTap: confirm,
-            child: Icon(Icons.check_circle_rounded, size: 20, color: AppColors.primary),
-          ),
-          const SizedBox(width: 6),
-          GestureDetector(
-            onTap: () => setState(() => _addingCustomProduct = false),
+            // Clearing first makes confirm() a no-op if the blur fires on the
+            // way out, so cancelling can never add the item.
+            onTap: () {
+              _customNameCtrl.clear();
+              _customPriceCtrl.clear();
+              setState(() => _addingCustomProduct = false);
+            },
             child: Icon(Icons.close_rounded, size: 18, color: AppColors.textMuted.withValues(alpha: 0.5)),
           ),
         ],
@@ -3277,8 +3316,10 @@ class _BillingScreenState extends State<BillingScreen> {
             ],
           ),
           const SizedBox(height: 10),
-          _summaryRow('TAX ($_taxLabel $_taxRateDisplay%)', cart.taxAmount),
-          const SizedBox(height: 12),
+          if (cart.taxAmount > 0) ...[
+            _summaryRow('TAX ($_taxLabel $_taxRateDisplay%)', cart.taxAmount),
+            const SizedBox(height: 12),
+          ],
           const Divider(height: 1, color: AppColors.border),
           const SizedBox(height: 14),
           Row(
@@ -4385,6 +4426,7 @@ class _BillingScreenState extends State<BillingScreen> {
       'receipt_footer': _receiptFooter,
       'tax_label': _taxLabel,
       'tax_rate': _taxRateDisplay,
+      'tax_enabled': _taxEnabled ? '1' : '0',
       'currency_code': _currencyCode,
       'currency_symbol': _currencySymbol,
       'dial_code': _dialCode,
@@ -4398,6 +4440,7 @@ class _BillingScreenState extends State<BillingScreen> {
       'auto_print': _autoPrint ? '1' : '0',
       'store_upi_id': _storeUpiId,
       'branch_number': _branchNumber,
+      'wa_use_api': _waUseApi ? '1' : '0',
       'wa_phone_number_id': _waPhoneNumberId,
       'wa_access_token': _waAccessToken,
     });
@@ -4689,12 +4732,50 @@ class _BillingScreenState extends State<BillingScreen> {
         _settingsPageTitle('Tax', Icons.percent_rounded),
         const SizedBox(height: 24),
         _settingsCard([
-          _settingsTextField('Tax Label', _editTaxLabel,
-              (v) => setState(() => _editTaxLabel = v)),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(children: [
+              Expanded(child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Charge Tax',
+                      style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600,
+                          color: _taxEnabled ? AppColors.primary : AppColors.textMuted)),
+                  Text(
+                      _taxEnabled
+                          ? 'Tax is added to bills and shown on receipts'
+                          : 'No tax is charged and no tax line is printed',
+                      style: GoogleFonts.inter(fontSize: 11, color: AppColors.textMuted)),
+                ],
+              )),
+              Switch(
+                value: _taxEnabled,
+                onChanged: (v) {
+                  setState(() => _taxEnabled = v);
+                  // Apply straight away so the open cart re-totals.
+                  _syncTaxRate();
+                },
+                activeTrackColor: AppColors.primary,
+                activeThumbColor: Colors.white,
+              ),
+            ]),
+          ),
           _settingsDivider(),
-          _settingsTextField('Tax Rate (%)', _editTaxRate,
-              (v) => setState(() => _editTaxRate = v),
-              keyboardType: TextInputType.number),
+          // The rate is kept while tax is off — turning it back on restores it.
+          Opacity(
+            opacity: _taxEnabled ? 1 : 0.4,
+            child: IgnorePointer(
+              ignoring: !_taxEnabled,
+              child: Column(children: [
+                _settingsTextField('Tax Label', _editTaxLabel,
+                    (v) => setState(() => _editTaxLabel = v)),
+                _settingsDivider(),
+                _settingsTextField('Tax Rate (%)', _editTaxRate,
+                    (v) => setState(() => _editTaxRate = v),
+                    keyboardType: TextInputType.number),
+              ]),
+            ),
+          ),
         ]),
       ],
     );
@@ -6028,6 +6109,33 @@ class _BillingScreenState extends State<BillingScreen> {
             style: GoogleFonts.inter(fontSize: 12.5, color: const Color(0xFF6E6E73)),
           ),
         ),
+        _settingsCard([
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(children: [
+              Expanded(child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Auto-send with Meta API',
+                      style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600,
+                          color: _waUseApi ? AppColors.primary : AppColors.textDark)),
+                  Text(
+                      _waUseApi
+                          ? 'ON — BillCat sends the PDF itself. Needs a live token and a verified number.'
+                          : 'OFF — opens WhatsApp with the bill ready to send. Works for any customer.',
+                      style: GoogleFonts.inter(fontSize: 11, color: AppColors.textMuted)),
+                ],
+              )),
+              Switch(
+                value: _waUseApi,
+                onChanged: (v) => setState(() => _waUseApi = v),
+                activeTrackColor: AppColors.primary,
+                activeThumbColor: Colors.white,
+              ),
+            ]),
+          ),
+        ]),
+        const SizedBox(height: 16),
         if (configured) ...[
           Container(
             padding: const EdgeInsets.all(12),
@@ -7316,6 +7424,97 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
+  /// Opens the inline Custom Product row in the cart and puts the cursor in
+  /// its name field — what the CUSTOM PRODUCT button does, for Shift + '+'.
+  void _startCustomProduct() {
+    setState(() {
+      _addingCustomProduct = true;
+      _customQty = 1;
+      _customNameCtrl.clear();
+      _customPriceCtrl.clear();
+    });
+    Future.microtask(() => _customNameFocus.requestFocus());
+  }
+
+  /// Everything the Confirm Payment button does, so Option+X can run the
+  /// identical path without showing the dialog. [paid] is what the customer
+  /// handed over; anything short of the total is recorded as credit.
+  Future<void> _finalizeCheckout(CartProvider cart,
+      {required double paid, required bool sendWa}) async {
+    final total = cart.total;
+    final invNum = _queuedInvoiceNo.isNotEmpty ? _queuedInvoiceNo : LocalDbService.generateInvoiceId();
+    final txId = _queuedTransactionId.isNotEmpty ? _queuedTransactionId : Uuid().v4();
+    final snapshot = _snapshotCart(cart, invoiceNumber: invNum, transactionId: txId);
+    final phone = cart.customerPhone;
+    final creditDue = (total - paid).clamp(0.0, total);
+    await cart.checkout(
+        invoiceNumber: invNum,
+        transactionId: txId,
+        paymentLabel: _hybridPaymentLabel(cart) ??
+            // Part-paid bills: note what was actually collected so the Cash vs
+            // Bank box doesn't count the unpaid half as notes in the drawer.
+            (creditDue > 0
+                ? '${cart.paymentMethod.name} '
+                    '(paid ${(total - creditDue).toStringAsFixed(2)}, '
+                    'due ${creditDue.toStringAsFixed(2)})'
+                : null));
+    _hybridCashCtrl.clear();
+    _hybridUpiCtrl.clear();
+    // Don't leave HYBRID selected for the next customer: an unnoticed empty
+    // split would book the whole bill as cash.
+    cart.setPaymentMethod(PaymentMethod.cash);
+    if (creditDue > 0 && phone.isNotEmpty) {
+      await LocalDbService.addCreditToCustomer(phone, creditDue);
+    }
+    await ConnectivityService.instance.syncNow();
+    _refreshQueuedInvoiceNo();
+    _customerNameCtrl.clear();
+    _customerPhoneCtrl.clear();
+    _loadProducts();
+    _loadDashboardData();
+    if (!context.mounted) return;
+    if (creditDue > 0) {
+      _showToast('Bill closed · $_currencySymbol${creditDue.toStringAsFixed(2)} credit recorded');
+    } else {
+      _showToast('Payment successful!');
+    }
+    if (_autoPrint) {
+      await _printRecord(snapshot);
+    }
+    _autoSavePdf(snapshot);
+    if (sendWa) {
+      _sendInvoiceViaWhatsApp(snapshot, phone);
+    }
+  }
+
+  /// Option+X: prints exactly what the Print Bill dialog is set to do, then
+  /// confirms the whole bill as paid in full — no Print Bill dialog, no
+  /// Confirm Payment dialog.
+  Future<void> _printThenCloseBill(CartProvider cart) async {
+    final hybridError = _hybridSplitError(cart);
+    if (hybridError != null) {
+      _showToast(hybridError, isError: true);
+      return;
+    }
+    final txId =
+        _queuedTransactionId.isNotEmpty ? _queuedTransactionId : Uuid().v4();
+    final snapshot = _snapshotCart(cart, transactionId: txId);
+    final docType = _lastPrintDocType;
+    // Nothing ticked in Print Bill still prints to the printer — the whole
+    // point of the shortcut is to print, and silence would look broken.
+    final toPrinter = _lastPrintToPrinter || !_lastPrintWhatsApp;
+    if (toPrinter) {
+      _printCurrentBill(cart, docType: docType, toPrinter: true);
+    }
+    if (_lastPrintWhatsApp) {
+      _sendInvoiceViaWhatsApp(snapshot, cart.customerPhone.trim(),
+          docType: docType);
+    }
+    // Paid in full: sendWa is false because the print step above already
+    // handled WhatsApp if it was selected.
+    await _finalizeCheckout(cart, paid: cart.total, sendWa: false);
+  }
+
   void _clearPrintingState() {
     _printSafetyTimer?.cancel();
     _printSafetyTimer = null;
@@ -7582,29 +7781,32 @@ class _BillingScreenState extends State<BillingScreen> {
         createdAt: DateTime.now(),
       );
 
+  /// Null when the hybrid cash/UPI split is usable, else why it isn't. A hybrid
+  /// bill must carry a split that actually adds up, or the Cash vs Bank report
+  /// (and the drawer count behind it) silently goes wrong.
+  String? _hybridSplitError(CartProvider cart) {
+    if (cart.paymentMethod != PaymentMethod.hybrid) return null;
+    final cash = parseAmount(_hybridCashCtrl.text);
+    final upi = parseAmount(_hybridUpiCtrl.text);
+    final diff = cart.total - (cash + upi);
+    if (cash <= 0 && upi <= 0) {
+      return 'Enter how much is cash and how much is UPI before closing';
+    }
+    if (diff.abs() >= 0.01) {
+      return diff > 0
+          ? '${fmtMoney(_currencySymbol, diff)} of this bill is not '
+              'allocated — adjust the cash/UPI split'
+          : '${fmtMoney(_currencySymbol, -diff)} more than the bill '
+              'total — adjust the cash/UPI split';
+    }
+    return null;
+  }
+
   void _closeBill(BuildContext context, CartProvider cart) {
-    // A hybrid bill must carry a split that actually adds up, or the Cash vs
-    // Bank report (and the drawer count behind it) silently goes wrong.
-    if (cart.paymentMethod == PaymentMethod.hybrid) {
-      final cash = parseAmount(_hybridCashCtrl.text);
-      final upi = parseAmount(_hybridUpiCtrl.text);
-      final diff = cart.total - (cash + upi);
-      if (cash <= 0 && upi <= 0) {
-        _showToast(
-            'Enter how much is cash and how much is UPI before closing',
-            isError: true);
-        return;
-      }
-      if (diff.abs() >= 0.01) {
-        _showToast(
-            diff > 0
-                ? '${fmtMoney(_currencySymbol, diff)} of this bill is not '
-                    'allocated — adjust the cash/UPI split'
-                : '${fmtMoney(_currencySymbol, -diff)} more than the bill '
-                    'total — adjust the cash/UPI split',
-            isError: true);
-        return;
-      }
+    final hybridError = _hybridSplitError(cart);
+    if (hybridError != null) {
+      _showToast(hybridError, isError: true);
+      return;
     }
     bool sendWaAfterClose = false;
     final hasPhone = cart.customerPhone.isNotEmpty;
@@ -7735,51 +7937,10 @@ class _BillingScreenState extends State<BillingScreen> {
                         color: AppColors.textMuted))),
             ElevatedButton(
               onPressed: () async {
-                final invNum = _queuedInvoiceNo.isNotEmpty ? _queuedInvoiceNo : LocalDbService.generateInvoiceId();
-                final txId = _queuedTransactionId.isNotEmpty ? _queuedTransactionId : Uuid().v4();
-                final snapshot = _snapshotCart(cart, invoiceNumber: invNum, transactionId: txId);
-                final phone = cart.customerPhone;
-                final creditDue = (total - (double.tryParse(paidCtrl.text) ?? total)).clamp(0.0, total);
+                final paidNow = double.tryParse(paidCtrl.text) ?? total;
                 Navigator.pop(ctx);
-                await cart.checkout(
-                    invoiceNumber: invNum,
-                    transactionId: txId,
-                    paymentLabel: _hybridPaymentLabel(cart) ??
-                        // Part-paid bills: note what was actually collected so
-                        // the Cash vs Bank box doesn't count the unpaid half
-                        // as notes in the drawer.
-                        (creditDue > 0
-                            ? '${cart.paymentMethod.name} '
-                                '(paid ${(total - creditDue).toStringAsFixed(2)}, '
-                                'due ${creditDue.toStringAsFixed(2)})'
-                            : null));
-                _hybridCashCtrl.clear();
-                _hybridUpiCtrl.clear();
-                // Don't leave HYBRID selected for the next customer: an
-                // unnoticed empty split would book the whole bill as cash.
-                cart.setPaymentMethod(PaymentMethod.cash);
-                if (creditDue > 0 && phone.isNotEmpty) {
-                  await LocalDbService.addCreditToCustomer(phone, creditDue);
-                }
-                await ConnectivityService.instance.syncNow();
-                _refreshQueuedInvoiceNo();
-                _customerNameCtrl.clear();
-                _customerPhoneCtrl.clear();
-                _loadProducts();
-                _loadDashboardData();
-                if (!context.mounted) return;
-                if (creditDue > 0) {
-                  _showToast('Bill closed · $_currencySymbol${creditDue.toStringAsFixed(2)} credit recorded');
-                } else {
-                  _showToast('Payment successful!');
-                }
-                if (_autoPrint) {
-                  await _printRecord(snapshot);
-                }
-                _autoSavePdf(snapshot);
-                if (sendWaAfterClose) {
-                  _sendInvoiceViaWhatsApp(snapshot, phone);
-                }
+                await _finalizeCheckout(cart,
+                    paid: paidNow, sendWa: sendWaAfterClose);
               },
               style: ElevatedButton.styleFrom(
                 backgroundColor: AppColors.success,
@@ -7924,6 +8085,34 @@ tbody td{font-size:13px;padding:10px 4px;vertical-align:top}
 </html>''';
   }
 
+  /// A phone number in the full international form Meta routes on, e.g.
+  /// 919600003905. Handles what shopkeepers actually type: "+91 96000 03905",
+  /// "096000 03905", "0091-9600003905" and a bare "9600003905".
+  ///
+  /// Decides on LENGTH, not on a "starts with 91" test — plenty of real Indian
+  /// mobiles begin with 91 themselves, and a prefix test would leave those
+  /// without their country code.
+  String _toInternationalPhone(String raw) {
+    final cc = _dialCode.replaceAll(RegExp(r'[^0-9]'), ''); // '+91' -> '91'
+    var digits = raw.replaceAll(RegExp(r'[^0-9]'), '');
+    digits = digits.replaceFirst(RegExp(r'^0+'), ''); // 00 prefix / trunk zero
+    if (cc.isNotEmpty && digits.length <= 10) digits = cc + digits;
+    return digits;
+  }
+
+  /// What the WhatsApp caption should say about payment. A quotation isn't
+  /// paid at all, and a part-paid bill saying "Paid" is a dispute waiting to
+  /// happen — the amount still due is carried in the transaction's payment
+  /// label by the checkout that wrote it.
+  String _waPaymentStatus(TransactionRecord tx, String docType) {
+    if (docType == 'Quotation') return '';
+    final due = RegExp(r'due\s+([0-9.]+)').firstMatch(tx.paymentMethod);
+    if (due != null) {
+      return 'Partly paid — $_currencySymbol${due.group(1)} still due';
+    }
+    return 'Paid';
+  }
+
   Future<void> _sendInvoiceViaWhatsApp(TransactionRecord tx, String phone, {String docType = 'Invoice'}) async {
     if (phone.isEmpty) {
       _showToast('No customer phone number to send to.', isError: true);
@@ -7940,8 +8129,16 @@ tbody td{font-size:13px;padding:10px 4px;vertical-align:top}
     final invoiceLink = 'https://billcat.in/invoices/$shortUid$branchPadded$invoiceNo';
     ConnectivityService.instance.syncNow().ignore();
 
+    // Meta routes on the FULL international number (919600003905). Customers
+    // are stored as plain 10-digit numbers, and the service only strips
+    // punctuation — so bills went out addressed to "9600003905" and were never
+    // delivered. The wa.me fallback below already did this; the API path did
+    // not. Length decides, not a prefix test: a real Indian mobile can itself
+    // begin "91", so checking the prefix would skip valid numbers.
+    final apiPhone = _toInternationalPhone(phone);
+
     // If Meta API is configured, send directly
-    if (_waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty) {
+    if (_waUseApi && _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty) {
       _showToast('Sending via WhatsApp...');
       try {
         final pdfBytes = await ReceiptPrinter.buildPdf(
@@ -7958,7 +8155,7 @@ tbody td{font-size:13px;padding:10px 4px;vertical-align:top}
         final svc = _wa.WhatsAppService(
             phoneNumberId: _waPhoneNumberId, accessToken: _waAccessToken);
         final ok = await svc.sendInvoicePdf(
-          toPhone: phone,
+          toPhone: apiPhone,
           pdfBytes: pdfBytes,
           invoiceNo: invoiceNo,
           storeName: _storeName,
@@ -7967,12 +8164,30 @@ tbody td{font-size:13px;padding:10px 4px;vertical-align:top}
           date: '${tx.createdAt.day}/${tx.createdAt.month}/${tx.createdAt.year}',
           docType: docType,
           invoiceLink: invoiceLink,
+          paymentStatus: _waPaymentStatus(tx, docType),
         );
-        if (mounted) _showToast(ok ? 'Invoice sent via WhatsApp!' : 'WhatsApp send failed.', isError: !ok);
+        if (ok) {
+          if (mounted) _showToast('Invoice sent via WhatsApp!');
+          return;
+        }
+        // Failed. Don't strand the bill: fall through and open WhatsApp with
+        // the link instead. An expired token or an unverified number must
+        // never mean the customer simply gets nothing.
+        debugPrint('[WA] API send failed, falling back: ${svc.lastError}');
+        if (mounted) {
+          final why = svc.lastError ?? 'send failed';
+          final short = why.length > 80 ? '${why.substring(0, 80)}…' : why;
+          _showToast('WhatsApp API failed — opening WhatsApp instead ($short)',
+              isError: true);
+        }
       } catch (e) {
-        if (mounted) _showToast('WhatsApp error: $e', isError: true);
+        debugPrint('[WA] API send threw, falling back: $e');
+        if (mounted) {
+          _showToast('WhatsApp API failed — opening WhatsApp instead',
+              isError: true);
+        }
       }
-      return;
+      // deliberately no return: continue to the link method below
     }
 
     // Fallback: open WhatsApp Web with pre-filled message
@@ -9466,6 +9681,12 @@ end tell
                       const SizedBox(width: 8),
                       Text('Edit', style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark)),
                     ])),
+                PopupMenuItem(value: 'stock', height: 38,
+                    child: Row(children: [
+                      const Icon(Icons.add_box_outlined, size: 14, color: AppColors.accentBlue),
+                      const SizedBox(width: 8),
+                      Text('Update Stock', style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark)),
+                    ])),
                 PopupMenuItem(value: 'barcode', height: 38,
                     child: Row(children: [
                       const Icon(Icons.barcode_reader, size: 14, color: AppColors.textMuted),
@@ -9482,6 +9703,8 @@ end tell
               onSelected: (v) async {
                 if (v == 'edit') {
                   _showEditProductDialog(p);
+                } else if (v == 'stock') {
+                  _showUpdateStockDialog(p);
                 } else if (v == 'barcode') {
                   _showPrintBarcodeDialog(p);
                 } else if (v == 'delete') {
@@ -10121,6 +10344,281 @@ end tell
     } catch (e) {
       if (mounted) _showToast('Print failed: $e', isError: true);
     }
+  }
+
+  /// Adds incoming stock to [p] and records it against a dealer. Only ever adds
+  /// — the existing quantity is never overwritten, so a mistyped figure can't
+  /// wipe real stock. Editing a quantity outright is still done in Edit Product.
+  void _showUpdateStockDialog(Product p) {
+    final addCtrls = <String, TextEditingController>{
+      for (final v in p.variants) v.id: TextEditingController(),
+    };
+    final baseCtrl = TextEditingController();
+    final costCtrl = TextEditingController(
+        text: p.buyingPrice > 0 ? p.buyingPrice.toStringAsFixed(2) : '');
+    String dealer = p.supplier;
+
+    int addedFor(String id) => int.tryParse(addCtrls[id]!.text.trim()) ?? 0;
+    int addedBase() => int.tryParse(baseCtrl.text.trim()) ?? 0;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) {
+        final totalAdded = p.variants.isEmpty
+            ? addedBase()
+            : p.variants.fold<int>(0, (s, v) => s + addedFor(v.id));
+        final cost = double.tryParse(costCtrl.text) ?? 0;
+        final dealerNames = [for (final d in _reportDealers) d.name];
+        if (dealer.isNotEmpty && !dealerNames.contains(dealer)) {
+          dealerNames.insert(0, dealer);
+        }
+        return Dialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          child: SizedBox(
+            width: 440,
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  Container(
+                    width: 34, height: 34,
+                    decoration: BoxDecoration(
+                        color: AppColors.accentBlue.withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(9)),
+                    child: const Icon(Icons.add_box_outlined, size: 18, color: AppColors.accentBlue),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('Update Stock', style: GoogleFonts.manrope(
+                        fontSize: 17, fontWeight: FontWeight.w800, color: AppColors.textDark)),
+                    Text(p.name, maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
+                  ])),
+                  GestureDetector(
+                    onTap: () => Navigator.pop(ctx),
+                    child: const Icon(Icons.close_rounded, size: 18, color: AppColors.textMuted),
+                  ),
+                ]),
+                const SizedBox(height: 20),
+                Row(children: [
+                  Expanded(child: Text('IN STOCK NOW', style: _dealerColHead())),
+                  SizedBox(width: 80, child: Text('ADD', textAlign: TextAlign.center, style: _dealerColHead())),
+                  SizedBox(width: 56, child: Text('NEW', textAlign: TextAlign.right, style: _dealerColHead())),
+                ]),
+                const SizedBox(height: 4),
+                const Divider(height: 1, color: AppColors.border),
+                if (p.variants.isEmpty)
+                  _stockAddRow(p.unit, p.stock, baseCtrl, addedBase(), setLocal)
+                else
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 220),
+                    child: SingleChildScrollView(
+                      child: Column(children: [
+                        for (final v in p.variants)
+                          _stockAddRow(v.name, v.stock, addCtrls[v.id]!, addedFor(v.id), setLocal),
+                      ]),
+                    ),
+                  ),
+                const Divider(height: 1, color: AppColors.border),
+                const SizedBox(height: 16),
+                _dlgLabel('DEALER / SUPPLIER'),
+                const SizedBox(height: 6),
+                DropdownButtonFormField<String>(
+                  value: dealer.isEmpty ? null : dealer,
+                  isExpanded: true,
+                  items: [
+                    for (final n in dealerNames)
+                      DropdownMenuItem(value: n, child: Text(n, maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark))),
+                    DropdownMenuItem(value: '__add_dealer__',
+                        child: Row(children: [
+                          const Icon(Icons.add_rounded, size: 14, color: AppColors.accentBlue),
+                          const SizedBox(width: 6),
+                          Text('Add Dealer', style: GoogleFonts.inter(
+                              fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.accentBlue)),
+                        ])),
+                  ],
+                  onChanged: (v) async {
+                    if (v == '__add_dealer__') {
+                      final added = await _showQuickAddDealerDialog(ctx);
+                      if (added != null && added.isNotEmpty) {
+                        setLocal(() => dealer = added);
+                      }
+                    } else if (v != null) {
+                      setLocal(() => dealer = v);
+                    }
+                  },
+                  decoration: _dlgInputDecor('Select dealer'),
+                  style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+                  dropdownColor: Colors.white,
+                ),
+                const SizedBox(height: 14),
+                _dlgLabel('BUYING PRICE ($_currencySymbol) PER UNIT'),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: costCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
+                  onChanged: (_) => setLocal(() {}),
+                  style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+                  decoration: _dlgInputDecor('0.00'),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppColors.surface,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: AppColors.border),
+                  ),
+                  child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    Text('$totalAdded ${p.unit} × ${_fmtComma(cost)}',
+                        style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
+                    Text(_fmtComma(cost * totalAdded), style: GoogleFonts.manrope(
+                        fontSize: 14, fontWeight: FontWeight.w800, color: AppColors.textDark)),
+                  ]),
+                ),
+                const SizedBox(height: 20),
+                Row(children: [
+                  const Spacer(),
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: Text('Cancel', style: GoogleFonts.inter(
+                        fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textMuted)),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: totalAdded <= 0
+                        ? null
+                        : () async {
+                            Navigator.pop(ctx);
+                            await _applyStockUpdate(p,
+                                baseAdd: addedBase(),
+                                variantAdds: {
+                                  for (final v in p.variants) v.id: addedFor(v.id)
+                                },
+                                dealerName: dealer,
+                                unitCost: cost);
+                          },
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.primary,
+                      foregroundColor: Colors.white,
+                      disabledBackgroundColor: AppColors.border,
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                    ),
+                    child: Text('Add Stock', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700)),
+                  ),
+                ]),
+              ]),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  Widget _stockAddRow(String label, int current, TextEditingController ctrl,
+      int added, StateSetter setLocal) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(children: [
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label, maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: GoogleFonts.inter(fontSize: 12.5, fontWeight: FontWeight.w600, color: AppColors.textDark)),
+          Text('$current now', style: GoogleFonts.inter(fontSize: 10.5, color: AppColors.textMuted)),
+        ])),
+        SizedBox(
+          width: 80,
+          child: TextField(
+            controller: ctrl,
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            textAlign: TextAlign.center,
+            onChanged: (_) => setLocal(() {}),
+            style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.textDark),
+            decoration: InputDecoration(
+              isDense: true,
+              hintText: '0',
+              hintStyle: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              filled: true,
+              fillColor: AppColors.surfaceVariant,
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 56,
+          child: Text('${current + added}', textAlign: TextAlign.right,
+              style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700,
+                  color: added > 0 ? AppColors.success : AppColors.textMuted)),
+        ),
+      ]),
+    );
+  }
+
+  /// Writes the new quantities and files the incoming stock against the dealer.
+  Future<void> _applyStockUpdate(Product p,
+      {required int baseAdd,
+      required Map<String, int> variantAdds,
+      required String dealerName,
+      required double unitCost}) async {
+    final newVariants = [
+      for (final v in p.variants) v.copyWith(stock: v.stock + (variantAdds[v.id] ?? 0)),
+    ];
+    final added = p.variants.isEmpty
+        ? baseAdd
+        : variantAdds.values.fold<int>(0, (s, n) => s + n);
+    if (added <= 0) return;
+    final updated = p.variants.isEmpty
+        ? p.copyWith(stock: p.stock + baseAdd)
+        : p.copyWith(
+            stock: newVariants.fold<int>(0, (s, v) => s + v.stock),
+            variants: newVariants);
+    await LocalDbService.updateProduct(updated);
+
+    // File it against the dealer, mirroring how Add Product records a purchase.
+    final matches = _reportDealers
+        .where((d) => d.name.toLowerCase() == dealerName.trim().toLowerCase())
+        .toList();
+    if (matches.isNotEmpty && unitCost > 0) {
+      final dealer = matches.first;
+      final now = DateTime.now();
+      final lines = p.variants.isEmpty
+          ? [(p.name, baseAdd)]
+          : [
+              for (final v in p.variants)
+                if ((variantAdds[v.id] ?? 0) > 0) ('${p.name} · ${v.name}', variantAdds[v.id]!)
+            ];
+      for (final (label, qty) in lines) {
+        await LocalDbService.insertDealerPurchase(DealerPurchase(
+          id: const Uuid().v4(),
+          dealerId: dealer.id,
+          dealerName: dealer.name,
+          productId: p.id,
+          productName: label,
+          qty: qty,
+          unitCost: unitCost,
+          amount: unitCost * qty,
+          source: 'product',
+          purchaseDate: now,
+          createdAt: now,
+        ));
+      }
+      await LocalDbService.recordDealerPurchase(
+          dealer.id, unitCost * added, unitCost * added);
+      await _loadReportDealers();
+    }
+    ConnectivityService.instance.syncNow();
+    _loadProducts();
+    _loadDashboardData();
+    if (mounted) _showToast('$added ${p.unit} added to ${p.name}');
   }
 
   void _confirmDeleteProduct(Product p) {
@@ -11637,10 +12135,37 @@ end tell
       _closeBill(context, cart);
       return true;
     }
+    // Option/Alt+X on Billing → print using whatever the Print Bill dialog is
+    // already set to do, then close the bill. One keystroke for the usual
+    // "print it and take the payment" ending.
+    if (event.logicalKey == LogicalKeyboardKey.keyX &&
+        HardwareKeyboard.instance.isAltPressed) {
+      if (_selectedTab != 1 || !noDialogOpen) return false;
+      if (_isPrinting) return true;
+      final cart = context.read<CartProvider>();
+      if (cart.items.isEmpty) {
+        _showToast('Cart is empty', isError: true);
+        return true;
+      }
+      _printThenCloseBill(cart);
+      return true;
+    }
     // Only on billing tab (tab 1), not inside a dialog
     if (_selectedTab != 1) return false;
     final isDialogOpen = ModalRoute.of(context)?.isCurrent == false;
     if (isDialogOpen) return false;
+    // Shift + '+' → open the Custom Product row, same as the button. The scan
+    // box holds focus whenever the screen is idle, so allow it from there;
+    // inside any other field '+' stays an ordinary typed character.
+    if (event.character == '+' || event.logicalKey == LogicalKeyboardKey.add) {
+      final pf = FocusManager.instance.primaryFocus;
+      final inAnotherField =
+          pf?.context?.widget is EditableText && !_searchFocus.hasFocus;
+      if (!inAnotherField && !_addingCustomProduct) {
+        _startCustomProduct();
+        return true;
+      }
+    }
     // If any text field has focus, don't intercept
     final focus = FocusManager.instance.primaryFocus;
     if (focus?.context?.widget is EditableText) return false;
@@ -13508,19 +14033,31 @@ end tell
     if (matches.isEmpty) return;
     final dealer = matches.first;
     final amount = product.buyingPrice * product.stock;
-    await LocalDbService.insertDealerPurchase(DealerPurchase(
-      id: const Uuid().v4(),
-      dealerId: dealer.id,
-      dealerName: dealer.name,
-      productId: product.id,
-      productName: product.name,
-      qty: product.stock,
-      unitCost: product.buyingPrice,
-      amount: amount,
-      source: 'product',
-      purchaseDate: product.purchaseDate ?? DateTime.now(),
-      createdAt: DateTime.now(),
-    ));
+    final when = product.purchaseDate ?? DateTime.now();
+    // Variants get a line each, sharing the product id. The history groups on
+    // that id, so the purchase reads as one product that opens up into the
+    // variants actually bought.
+    final lines = product.variants.isEmpty
+        ? [(product.name, product.stock)]
+        : [
+            for (final v in product.variants)
+              if (v.stock > 0) ('${product.name} · ${v.name}', v.stock)
+          ];
+    for (final (label, qty) in lines) {
+      await LocalDbService.insertDealerPurchase(DealerPurchase(
+        id: const Uuid().v4(),
+        dealerId: dealer.id,
+        dealerName: dealer.name,
+        productId: product.id,
+        productName: label,
+        qty: qty,
+        unitCost: product.buyingPrice,
+        amount: product.buyingPrice * qty,
+        source: 'product',
+        purchaseDate: when,
+        createdAt: DateTime.now(),
+      ));
+    }
     // paidNow == amount, so balance_payable moves by zero.
     await LocalDbService.recordDealerPurchase(dealer.id, amount, amount);
     await _loadReportDealers();
@@ -13665,13 +14202,16 @@ end tell
   }
 
   void _showDealerDetail(Dealer d) {
+    // Held outside the builder so expanding a row doesn't re-query the ledger.
+    final historyFuture = LocalDbService.getDealerPurchases(d.id);
+    final expanded = <String>{};
     showDialog(
       context: context,
-      builder: (ctx) => Dialog(
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) => Dialog(
         backgroundColor: Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
         child: SizedBox(
-          width: 440,
+          width: 480,
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -13696,109 +14236,217 @@ end tell
                 ),
               ]),
               const SizedBox(height: 20),
-              Row(children: [
-                Expanded(child: _dealerStatBox('Total Purchased', _fmtComma(d.totalPurchased), AppColors.textDark, AppColors.surface)),
-                const SizedBox(width: 12),
-                Expanded(child: _dealerStatBox('You Owe', _fmtComma(d.balancePayable),
-                    d.balancePayable > 0 ? const Color(0xFFE65100) : AppColors.textDark,
-                    d.balancePayable > 0 ? const Color(0xFFFFF3E0) : AppColors.surface)),
-              ]),
-              const SizedBox(height: 20),
-              Row(children: [
-                Expanded(child: OutlinedButton.icon(
-                  onPressed: () { Navigator.pop(ctx); _showDealerPurchaseDialog(d); },
-                  icon: const Icon(Icons.add_shopping_cart_outlined, size: 16),
-                  label: Text('Record Purchase', style: GoogleFonts.inter(fontSize: 12.5, fontWeight: FontWeight.w600)),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: AppColors.primary,
-                    side: BorderSide(color: AppColors.primary.withValues(alpha: 0.4)),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
-                  ),
-                )),
-                const SizedBox(width: 12),
-                Expanded(child: ElevatedButton.icon(
-                  onPressed: d.balancePayable > 0 ? () { Navigator.pop(ctx); _showDealerPaymentDialog(d); } : null,
-                  icon: const Icon(Icons.payments_outlined, size: 16),
-                  label: Text('Pay Dealer', style: GoogleFonts.inter(fontSize: 12.5, fontWeight: FontWeight.w700)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF34C759),
-                    foregroundColor: Colors.white,
-                    disabledBackgroundColor: const Color(0xFF34C759).withValues(alpha: 0.4),
-                    elevation: 0,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
-                  ),
-                )),
-              ]),
-              const SizedBox(height: 20),
-              Text('PURCHASE HISTORY', style: GoogleFonts.inter(
-                  fontSize: 10, fontWeight: FontWeight.w600,
-                  color: AppColors.textMuted, letterSpacing: 1)),
-              const SizedBox(height: 8),
               FutureBuilder<List<DealerPurchase>>(
-                future: LocalDbService.getDealerPurchases(d.id),
+                future: historyFuture,
                 builder: (_, snap) {
                   if (snap.connectionState != ConnectionState.done) {
-                    return const SizedBox(height: 56, child: Center(
+                    return const SizedBox(height: 120, child: Center(
                       child: SizedBox(width: 18, height: 18,
                           child: CircularProgressIndicator(strokeWidth: 2)),
                     ));
                   }
                   final items = snap.data ?? const <DealerPurchase>[];
-                  if (items.isEmpty) {
-                    return Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.symmetric(vertical: 18),
-                      decoration: BoxDecoration(
-                        color: AppColors.surface,
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: AppColors.border),
-                      ),
-                      child: Text('No purchases recorded yet',
-                          textAlign: TextAlign.center,
-                          style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
-                    );
+                  final totalUnits = items.fold<int>(0, (s, p) => s + p.qty);
+                  // One entry per product, holding its variant lines. Rows
+                  // without a product id (older manual entries) stand alone.
+                  final groups = <String, List<DealerPurchase>>{};
+                  for (final p in items) {
+                    groups.putIfAbsent(
+                        p.productId.isEmpty ? p.id : p.productId, () => []).add(p);
                   }
-                  return ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 200),
-                    child: ListView.separated(
-                      shrinkWrap: true,
-                      padding: EdgeInsets.zero,
-                      itemCount: items.length,
-                      separatorBuilder: (_, _) =>
-                          const Divider(height: 1, color: AppColors.border),
-                      itemBuilder: (_, i) {
-                        final p = items[i];
-                        final sub = [
-                          _fmtDate(p.purchaseDate),
-                          if (p.qty > 0) '${p.qty} × ${_fmtComma(p.unitCost)}',
-                          if (p.source == 'manual') 'manual entry',
-                        ].join(' · ');
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 9),
-                          child: Row(children: [
-                            Expanded(child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(p.productName.isEmpty ? 'Purchase' : p.productName,
-                                    maxLines: 1, overflow: TextOverflow.ellipsis,
-                                    style: GoogleFonts.inter(fontSize: 12.5,
-                                        fontWeight: FontWeight.w600, color: AppColors.textDark)),
-                                const SizedBox(height: 2),
-                                Text(sub, style: GoogleFonts.inter(
-                                    fontSize: 11, color: AppColors.textMuted)),
-                              ],
-                            )),
-                            const SizedBox(width: 10),
-                            Text(_fmtComma(p.amount), style: GoogleFonts.manrope(
-                                fontSize: 13, fontWeight: FontWeight.w700,
-                                color: AppColors.textDark)),
-                          ]),
-                        );
-                      },
-                    ),
-                  );
+                  final keys = groups.keys.toList();
+                  return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      Expanded(child: _dealerStatBox('Total Purchased',
+                          _fmtComma(d.totalPurchased), AppColors.textDark, AppColors.surface)),
+                      const SizedBox(width: 12),
+                      Expanded(child: _dealerStatBox('Total Stock',
+                          '$totalUnits', AppColors.textDark, AppColors.surface)),
+                    ]),
+                    const SizedBox(height: 20),
+                    Text('PURCHASE HISTORY', style: GoogleFonts.inter(
+                        fontSize: 10, fontWeight: FontWeight.w600,
+                        color: AppColors.textMuted, letterSpacing: 1)),
+                    const SizedBox(height: 8),
+                    if (items.isNotEmpty) ...[
+                      Row(children: [
+                        Expanded(child: Text('ITEM', style: _dealerColHead())),
+                        SizedBox(width: 52, child: Text('QTY',
+                            textAlign: TextAlign.center, style: _dealerColHead())),
+                        SizedBox(width: 92, child: Text('TOTAL',
+                            textAlign: TextAlign.right, style: _dealerColHead())),
+                      ]),
+                      const SizedBox(height: 4),
+                      const Divider(height: 1, color: AppColors.border),
+                    ],
+                    if (items.isEmpty)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(vertical: 18),
+                        decoration: BoxDecoration(
+                          color: AppColors.surface,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: AppColors.border),
+                        ),
+                        child: Text('No purchases recorded yet',
+                            textAlign: TextAlign.center,
+                            style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
+                      )
+                    else
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 300),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          // Keep the scrollbar off the TOTAL column.
+                          padding: const EdgeInsets.only(right: 12),
+                          itemCount: keys.length,
+                          separatorBuilder: (_, _) =>
+                              const Divider(height: 1, color: AppColors.border),
+                          itemBuilder: (_, i) {
+                            final rows = groups[keys[i]]!;
+                            final first = rows.first;
+                            final qty = rows.fold<int>(0, (s, p) => s + p.qty);
+                            final amt = rows.fold<double>(0, (s, p) => s + p.amount);
+                            // The shared base name; variant suffixes differ.
+                            final title = rows.length > 1
+                                ? first.productName.split(' · ').first
+                                : (first.productName.isEmpty ? 'Purchase' : first.productName);
+                            final open = expanded.contains(keys[i]);
+                            // Purchases recorded before variant lines existed
+                            // still open: fall back to the product's variants
+                            // as they stand in inventory.
+                            final prod = _products
+                                .where((p) => p.id == first.productId)
+                                .toList();
+                            final invVariants = rows.length > 1 || prod.isEmpty
+                                ? const <ProductVariant>[]
+                                : prod.first.variants;
+                            final sub = [
+                              _fmtDate(first.purchaseDate),
+                              '${_fmtComma(first.unitCost)} each',
+                              if (rows.length > 1) '${rows.length} variants',
+                              if (first.source == 'manual') 'manual entry',
+                            ].join(' · ');
+                            return Column(children: [
+                              InkWell(
+                                onTap: () => setLocal(() => open
+                                    ? expanded.remove(keys[i])
+                                    : expanded.add(keys[i])),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 9),
+                                  child: Row(children: [
+                                    SizedBox(
+                                      width: 16,
+                                      child: Icon(
+                                          open
+                                              ? Icons.keyboard_arrow_down_rounded
+                                              : Icons.keyboard_arrow_right_rounded,
+                                          size: 16, color: AppColors.textMuted),
+                                    ),
+                                    Expanded(child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                            style: GoogleFonts.inter(fontSize: 12.5,
+                                                fontWeight: FontWeight.w600, color: AppColors.textDark)),
+                                        const SizedBox(height: 2),
+                                        Text(sub, style: GoogleFonts.inter(
+                                            fontSize: 10.5, color: AppColors.textMuted)),
+                                      ],
+                                    )),
+                                    SizedBox(width: 52, child: Text('$qty',
+                                        textAlign: TextAlign.center,
+                                        style: GoogleFonts.inter(fontSize: 12.5,
+                                            fontWeight: FontWeight.w600, color: AppColors.textDark))),
+                                    SizedBox(width: 92, child: Text(_fmtComma(amt),
+                                        textAlign: TextAlign.right,
+                                        style: GoogleFonts.manrope(fontSize: 13,
+                                            fontWeight: FontWeight.w700, color: AppColors.textDark))),
+                                  ]),
+                                ),
+                              ),
+                              if (open)
+                                Container(
+                                  width: double.infinity,
+                                  margin: const EdgeInsets.only(left: 16, bottom: 10),
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    color: AppColors.surface,
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(color: AppColors.border),
+                                  ),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      _dealerDetailLine('Purchased on', _fmtDate(first.purchaseDate)),
+                                      _dealerDetailLine('Unit cost', _fmtComma(first.unitCost)),
+                                      _dealerDetailLine('Quantity', '$qty'),
+                                      _dealerDetailLine('Total', _fmtComma(amt)),
+                                      // The variants actually bought, when the
+                                      // purchase recorded them line by line.
+                                      if (rows.length > 1) ...[
+                                        const SizedBox(height: 8),
+                                        Text('VARIANTS PURCHASED', style: _dealerColHead()),
+                                        const SizedBox(height: 4),
+                                        for (final v in rows)
+                                          Padding(
+                                            padding: const EdgeInsets.only(top: 6),
+                                            child: Row(children: [
+                                              Expanded(child: Text(
+                                                  v.productName.contains(' · ')
+                                                      ? v.productName.split(' · ').last
+                                                      : v.productName,
+                                                  maxLines: 1, overflow: TextOverflow.ellipsis,
+                                                  style: GoogleFonts.inter(fontSize: 11.5,
+                                                      fontWeight: FontWeight.w500, color: AppColors.textDark))),
+                                              SizedBox(width: 52, child: Text('${v.qty}',
+                                                  textAlign: TextAlign.center,
+                                                  style: GoogleFonts.inter(fontSize: 11.5, color: AppColors.textDark))),
+                                              SizedBox(width: 80, child: Text(_fmtComma(v.amount),
+                                                  textAlign: TextAlign.right,
+                                                  style: GoogleFonts.inter(fontSize: 11.5,
+                                                      fontWeight: FontWeight.w600, color: AppColors.textDark))),
+                                            ]),
+                                          ),
+                                      ] else if (invVariants.isNotEmpty) ...[
+                                        const SizedBox(height: 10),
+                                        Text('VARIANTS', style: _dealerColHead()),
+                                        const SizedBox(height: 6),
+                                        // No per-variant figures were saved for
+                                        // this purchase, so show the names only
+                                        // rather than zeros that look like data.
+                                        Wrap(spacing: 6, runSpacing: 6, children: [
+                                          for (final v in invVariants)
+                                            Container(
+                                              padding: const EdgeInsets.symmetric(
+                                                  horizontal: 8, vertical: 4),
+                                              decoration: BoxDecoration(
+                                                color: Colors.white,
+                                                borderRadius: BorderRadius.circular(6),
+                                                border: Border.all(color: AppColors.border),
+                                              ),
+                                              child: Text(
+                                                  v.price > 0
+                                                      ? '${v.name} · ${_fmtComma(v.price)}'
+                                                      : v.name,
+                                                  style: GoogleFonts.inter(fontSize: 10.5,
+                                                      fontWeight: FontWeight.w500,
+                                                      color: AppColors.textDark)),
+                                            ),
+                                        ]),
+                                        const SizedBox(height: 6),
+                                        Text('Not itemised on this purchase.',
+                                            style: GoogleFonts.inter(fontSize: 9.5,
+                                                color: AppColors.textMuted)),
+                                      ],
+                                    ],
+                                  ),
+                                ),
+                            ]);
+                          },
+                        ),
+                      ),
+                  ]);
                 },
               ),
               const SizedBox(height: 14),
@@ -13813,9 +14461,22 @@ end tell
             ]),
           ),
         ),
-      ),
+      )),
     );
   }
+
+  Widget _dealerDetailLine(String label, String value) => Padding(
+    padding: const EdgeInsets.only(bottom: 4),
+    child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+      Text(label, style: GoogleFonts.inter(fontSize: 11, color: AppColors.textMuted)),
+      Text(value, style: GoogleFonts.inter(
+          fontSize: 11.5, fontWeight: FontWeight.w600, color: AppColors.textDark)),
+    ]),
+  );
+
+  TextStyle _dealerColHead() => GoogleFonts.inter(
+      fontSize: 9, fontWeight: FontWeight.w700,
+      color: AppColors.textMuted, letterSpacing: 0.8);
 
   Widget _dealerStatBox(String label, String value, Color valueColor, Color bg) => Container(
     padding: const EdgeInsets.all(14),

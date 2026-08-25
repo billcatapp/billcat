@@ -310,7 +310,7 @@ class ReceiptPrinter {
             if (tx.discountAmount > 0)
               _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', regular, fs,
                   valueColor: PdfColors.green800),
-            _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', regular, fs),
+            if (tx.taxAmount > 0) _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', regular, fs),
             pw.SizedBox(height: 4),
             pw.Divider(thickness: 1, color: PdfColors.black),
             pw.SizedBox(height: 4),
@@ -323,7 +323,7 @@ class ReceiptPrinter {
             _totalRow('Payment', tx.paymentMethod.toUpperCase(), regular, fs),
 
             // ── GST tax summary table (GST Invoice layout) ────────────────
-            if (isGst) ...[
+            if (isGst && tx.taxAmount > 0) ...[
               pw.SizedBox(height: 8),
               sep,
               pw.SizedBox(height: 4),
@@ -450,7 +450,7 @@ class ReceiptPrinter {
               pw.SizedBox(width: 200, child: pw.Column(children: [
                 _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
                 if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
-                _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
+                if (tx.taxAmount > 0) _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
                 pw.Divider(thickness: 1.5, color: const PdfColor.fromInt(0xFF2D2D2D)),
                 pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
                   pw.Text('TOTAL', style: pw.TextStyle(font: b, fontSize: fs + 4, color: const PdfColor.fromInt(0xFF2D2D2D))),
@@ -527,7 +527,7 @@ class ReceiptPrinter {
             child: pw.Column(children: [
               _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
               if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
-              _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
+              if (tx.taxAmount > 0) _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
               pw.Divider(thickness: 0.5),
               pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
                 pw.Text('TOTAL', style: pw.TextStyle(font: b, fontSize: fs + 3)),
@@ -589,7 +589,7 @@ class ReceiptPrinter {
         pw.Divider(color: PdfColors.grey400, thickness: 0.5),
         _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
         if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
-        _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
+        if (tx.taxAmount > 0) _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
         pw.Divider(thickness: 1, color: PdfColors.black),
         pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
           pw.Text('TOTAL', style: pw.TextStyle(font: b, fontSize: fs + 3)),
@@ -659,7 +659,7 @@ class ReceiptPrinter {
           pw.SizedBox(width: 200, child: pw.Column(children: [
             _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
             if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
-            _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
+            if (tx.taxAmount > 0) _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
             pw.Divider(thickness: 1, color: PdfColors.black),
             pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
               pw.Text('TOTAL', style: pw.TextStyle(font: b, fontSize: fs + 3)),
@@ -701,7 +701,7 @@ class ReceiptPrinter {
           border: pw.TableBorder.all(color: PdfColors.grey400, width: 0.5),
           children: [
             pw.TableRow(decoration: const pw.BoxDecoration(color: PdfColors.grey100), children: [
-              for (final item in [('Items', '${tx.items.length}'), ('Total Qty', '$totalQty'), ('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}'), ('Tax', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}'), ('Total', '$currencySymbol${tx.total.toStringAsFixed(2)}')])
+              for (final item in [('Items', '${tx.items.length}'), ('Total Qty', '$totalQty'), ('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}'), if (tx.taxAmount > 0) ('Tax', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}'), ('Total', '$currencySymbol${tx.total.toStringAsFixed(2)}')])
                 pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 8), child: pw.Column(children: [
                   pw.Text(item.$1, style: pw.TextStyle(font: r, fontSize: fs - 2, color: PdfColors.grey600)),
                   pw.SizedBox(height: 2),
@@ -811,7 +811,7 @@ class ReceiptPrinter {
               pw.SizedBox(width: 220, child: pw.Column(children: [
                 _totalRow('Taxable Value', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs - 0.5),
                 if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs - 0.5, valueColor: PdfColors.green800),
-                _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs - 0.5),
+                if (tx.taxAmount > 0) _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs - 0.5),
                 pw.Divider(thickness: 1, color: PdfColors.black),
                 pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
                   pw.Text('Grand Total', style: pw.TextStyle(font: b, fontSize: fs + 2)),
@@ -1136,7 +1136,7 @@ class ReceiptPrinter {
                   totRow('Sub Total', '$currencySymbol ${tx.subtotal.toStringAsFixed(2)}'),
                   if (tx.discountAmount > 0)
                     totRow('Discount', '$currencySymbol ${tx.discountAmount.toStringAsFixed(2)}', vc: PdfColors.green800),
-                  totRow('Tax ($taxRate%)', '$currencySymbol ${tx.taxAmount.toStringAsFixed(2)}'),
+                  if (tx.taxAmount > 0) totRow('Tax ($taxRate%)', '$currencySymbol ${tx.taxAmount.toStringAsFixed(2)}'),
                   pw.Divider(thickness: 0.5, color: PdfColors.grey400),
                   totRow('Total', '$currencySymbol ${tx.total.toStringAsFixed(2)}',
                       bold: true, fs2: fs + 0.5),
@@ -1425,10 +1425,12 @@ class ReceiptPrinter {
                     t(': ', s: fs - 0.5, c: PdfColors.grey600),
                     t('-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', f: bold, s: fs - 0.5, c: PdfColors.green800),
                   ],
-                  pw.SizedBox(width: 12),
-                  t('Tax ($taxRate%)', s: fs - 0.5),
-                  t(': ', s: fs - 0.5, c: PdfColors.grey600),
-                  t('$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', f: bold, s: fs - 0.5),
+                  if (tx.taxAmount > 0) ...[
+                    pw.SizedBox(width: 12),
+                    t('Tax ($taxRate%)', s: fs - 0.5),
+                    t(': ', s: fs - 0.5, c: PdfColors.grey600),
+                    t('$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', f: bold, s: fs - 0.5),
+                  ],
                   pw.Spacer(),
                   t('Total', f: bold, s: fs - 0.5),
                   t(': ', f: bold, s: fs - 0.5, c: PdfColors.grey600),
@@ -1448,6 +1450,7 @@ class ReceiptPrinter {
                   pw.TableRow(children: [
                     // Tax Summary
                     pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.stretch, children: [
+                      if (tx.taxAmount > 0)
                       pw.Table(
                         border: const pw.TableBorder(
                           horizontalInside: grey4,
@@ -1496,7 +1499,7 @@ class ReceiptPrinter {
                         _tiTotalRow('Sub Total', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', regular, fs - 0.5),
                         if (tx.discountAmount > 0)
                           _tiTotalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', regular, fs - 0.5, valueColor: PdfColors.green800),
-                        _tiTotalRow('Tax ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', regular, fs - 0.5),
+                        if (tx.taxAmount > 0) _tiTotalRow('Tax ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', regular, fs - 0.5),
                         pw.Divider(thickness: 0.5, color: PdfColors.grey400),
                         _tiTotalRow('Total', '$currencySymbol${tx.total.toStringAsFixed(2)}', bold, fs + 1),
                         pw.SizedBox(height: 4),
@@ -1963,6 +1966,7 @@ class ReceiptPrinter {
             children: [pw.TableRow(children: [
               // Left: payment mode + tax summary
               pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.stretch, children: [
+                if (tx.taxAmount > 0) ...[
                 // CGST/SGST header
                 pw.Container(
                   color: PdfColors.grey100,
@@ -2034,6 +2038,7 @@ class ReceiptPrinter {
                   total: tx.taxAmount.toStringAsFixed(2),
                   font: b, bg: PdfColors.grey100,
                 ),
+                ],
                 pw.Container(
                   decoration: const pw.BoxDecoration(border: pw.Border(top: border4)),
                   padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 5),

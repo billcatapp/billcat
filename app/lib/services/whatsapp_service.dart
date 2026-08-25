@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -6,7 +7,35 @@ class WhatsAppService {
   final String phoneNumberId;
   final String accessToken;
 
+  /// Meta's own error text from the last failed call. Kept so a failure can say
+  /// WHY — "send failed" alone gives the shopkeeper nothing to act on.
+  String? lastError;
+
+  // Without these a half-open connection never resolves: the send Future hangs
+  // forever, no success or failure toast ever fires, and the bill is silently
+  // lost while the counter moves on. Upload gets longer — the PDF is bigger.
+  static const Duration _connectTimeout = Duration(seconds: 10);
+  static const Duration _uploadTimeout = Duration(seconds: 45);
+  static const Duration _sendTimeout = Duration(seconds: 30);
+
   WhatsAppService({required this.phoneNumberId, required this.accessToken});
+
+  /// Pulls the human-readable message out of a Graph API error body.
+  static String _describe(int status, String body) {
+    try {
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final err = json['error'] as Map<String, dynamic>?;
+      if (err != null) {
+        final msg = (err['message'] ?? '').toString();
+        final detail = (err['error_data'] is Map)
+            ? ((err['error_data'] as Map)['details'] ?? '').toString()
+            : '';
+        final code = err['code']?.toString() ?? '$status';
+        return detail.isNotEmpty ? '[$code] $detail' : '[$code] $msg';
+      }
+    } catch (_) {}
+    return 'HTTP $status: ${body.length > 200 ? body.substring(0, 200) : body}';
+  }
 
   static String _normalize(String phone) {
     // Strip spaces, dashes, parens; ensure starts with country code digits only
@@ -38,24 +67,38 @@ class WhatsAppService {
     multipart.setRange(headerBytes.length, headerBytes.length + pdfBytes.length, pdfBytes);
     multipart.setRange(headerBytes.length + pdfBytes.length, multipart.length, footer);
 
-    final client = HttpClient();
+    final client = HttpClient()..connectionTimeout = _connectTimeout;
     try {
       final req = await client.postUrl(uri);
       req.headers.set('Authorization', 'Bearer $accessToken');
       req.headers.set('Content-Type', 'multipart/form-data; boundary=$boundary');
       req.headers.contentLength = multipart.length;
       req.add(multipart);
-      final res = await req.close();
-      final respStr = await res.transform(utf8.decoder).join();
-      final json = jsonDecode(respStr) as Map<String, dynamic>;
-      if (res.statusCode == 200 && json.containsKey('id')) {
-        return json['id'] as String;
+      final res = await req.close().timeout(_uploadTimeout);
+      final respStr =
+          await res.transform(utf8.decoder).join().timeout(_uploadTimeout);
+      // Status FIRST: a proxy or captive portal answers with HTML, and parsing
+      // that threw a Dart error that hid the real HTTP failure.
+      if (res.statusCode != 200) {
+        lastError = 'PDF upload — ${_describe(res.statusCode, respStr)}';
+        return null;
       }
+      final decoded = jsonDecode(respStr);
+      if (decoded is Map<String, dynamic> && decoded['id'] is String) {
+        return decoded['id'] as String;
+      }
+      lastError = 'PDF upload — no media id in reply: '
+          '${respStr.length > 200 ? respStr.substring(0, 200) : respStr}';
       return null;
-    } catch (_) {
+    } on TimeoutException {
+      lastError = 'PDF upload timed out — check the internet connection';
+      return null;
+    } catch (e) {
+      lastError = 'PDF upload — $e';
       return null;
     } finally {
-      client.close();
+      // force: a hung socket must actually be torn down, not pooled.
+      client.close(force: true);
     }
   }
 
@@ -70,6 +113,10 @@ class WhatsAppService {
     String date = '',
     String docType = 'Invoice',
     String invoiceLink = '',
+    /// What the caption should say about payment. Empty omits the line, which
+    /// is what a Quotation needs. Defaults to the previous hardcoded value so
+    /// no existing caller changes behaviour.
+    String paymentStatus = 'Paid',
   }) async {
     final phone = _normalize(toPhone);
     if (phone.isEmpty) return false;
@@ -84,7 +131,7 @@ class WhatsAppService {
         'Your e-bill for $docType #$invoiceNo has been generated successfully.\n\n'
         'Amount: $amount\n'
         'Date: $date\n'
-        'Payment Status: Paid\n\n'
+        '${paymentStatus.isEmpty ? '' : 'Payment Status: $paymentStatus\n'}\n'
         'Please find your bill attached.\n\n'
         'For any queries, feel free to contact us.\n'
         'Thank you for your support!\n\n'
@@ -142,18 +189,32 @@ class WhatsAppService {
   Future<bool> _sendMessage(String jsonPayload) async {
     final uri = Uri.parse(
         'https://graph.facebook.com/v19.0/$phoneNumberId/messages');
-    final client = HttpClient();
+    final client = HttpClient()..connectionTimeout = _connectTimeout;
     try {
       final req = await client.postUrl(uri);
       req.headers.set('Authorization', 'Bearer $accessToken');
-      req.headers.contentType = ContentType('application', 'json');
-      req.write(jsonPayload);
-      final res = await req.close();
-      return res.statusCode == 200;
-    } catch (_) {
+      // The charset is not decoration: dart:io falls back to latin1 when the
+      // content type omits one, and the caption carries ₹ (U+20B9), which
+      // latin1 cannot encode — the write threw before reaching Meta. Send the
+      // JSON as explicit UTF-8 bytes so any currency or regional text is safe.
+      req.headers.contentType =
+          ContentType('application', 'json', charset: 'utf-8');
+      final payloadBytes = utf8.encode(jsonPayload);
+      req.headers.contentLength = payloadBytes.length;
+      req.add(payloadBytes);
+      final res = await req.close().timeout(_sendTimeout);
+      final body = await res.transform(utf8.decoder).join().timeout(_sendTimeout);
+      if (res.statusCode == 200) return true;
+      lastError = _describe(res.statusCode, body);
+      return false;
+    } on TimeoutException {
+      lastError = 'WhatsApp timed out — check the internet connection';
+      return false;
+    } catch (e) {
+      lastError = '$e';
       return false;
     } finally {
-      client.close();
+      client.close(force: true);
     }
   }
 }
