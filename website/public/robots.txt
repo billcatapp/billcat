@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://billcat.in/sitemap.xml
+Sitemap: https://www.billcat.in/sitemap.xml
