@@ -346,6 +346,10 @@ class _BillingScreenState extends State<BillingScreen> {
   String _queuedInvoiceNo = '';
   String _queuedTransactionId = '';
 
+  // Auto-saved invoice PDFs. Empty path = ~/Documents (the previous default).
+  bool _autoSaveReceipts = true;
+  String _receiptSaveDir = '';
+
   // Barcode print last-used settings
   double _barcodeLabelW = 58;
   double _barcodeLabelH = 30;
@@ -415,9 +419,10 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // WhatsApp Meta Cloud API
   // Off => open WhatsApp with a pre-filled message and the bill link (works
-  // for anyone, no Meta setup). On => send the PDF through the Cloud API,
-  // which needs a live token and a verified number.
-  bool _waUseApi = false;
+  // for anyone, no Meta setup). On => send the PDF through BillCat's relay
+  // (BillCat's own number; shops never hold a token). On by default so every
+  // shop gets e-bills without any setup.
+  bool _waUseApi = true;
   String _waPhoneNumberId = '';
   String _waAccessToken = '';
   String _editWaPhoneNumberId = '';
@@ -500,6 +505,8 @@ class _BillingScreenState extends State<BillingScreen> {
       _taxLabel = s['tax_label'] ?? _taxLabel;
       _taxRateDisplay = s['tax_rate'] ?? _taxRateDisplay;
       _taxEnabled = (s['tax_enabled'] ?? '1') == '1';
+      _autoSaveReceipts = (s['receipt_autosave'] ?? '1') == '1';
+      _receiptSaveDir = s['receipt_save_dir'] ?? '';
       _currencyCode = s['currency_code'] ?? _currencyCode;
       _currencySymbol = s['currency_symbol'] ?? _currencySymbol;
       _dialCode = s['dial_code'] ?? _dialCode;
@@ -530,7 +537,10 @@ class _BillingScreenState extends State<BillingScreen> {
       _branchNumber = s['branch_number'] ?? _branchNumber;
       _ownerPasscode    = s['owner_passcode'] ?? '';
       _ownerLockEnabled = (s['owner_lock_enabled'] ?? '0') == '1';
-      _waUseApi = (s['wa_use_api'] ?? '0') == '1';
+      // Read from 'wa_enabled' (same key as the Windows app), not
+      // 'wa_use_api': every settings save wrote 'wa_use_api' = '0', so a new
+      // default on that key would never reach existing shops.
+      _waUseApi = (s['wa_enabled'] ?? '1') == '1';
       _waPhoneNumberId = s['wa_phone_number_id'] ?? '';
       _waAccessToken = s['wa_access_token'] ?? '';
       _editWaPhoneNumberId = _waPhoneNumberId;
@@ -2462,6 +2472,7 @@ class _BillingScreenState extends State<BillingScreen> {
       },
       itemBuilder: (_) => [
         'Quotation',
+        'GST',
       ].map((v) => PopupMenuItem<String>(
         value: v,
         height: 40,
@@ -2469,6 +2480,7 @@ class _BillingScreenState extends State<BillingScreen> {
           Icon(
             switch (v) {
               'Quotation' => Icons.request_quote_outlined,
+              'GST'       => Icons.receipt_long_outlined,
               _           => Icons.build_outlined,
             },
             size: 16,
@@ -4427,6 +4439,8 @@ class _BillingScreenState extends State<BillingScreen> {
       'tax_label': _taxLabel,
       'tax_rate': _taxRateDisplay,
       'tax_enabled': _taxEnabled ? '1' : '0',
+      'receipt_autosave': _autoSaveReceipts ? '1' : '0',
+      'receipt_save_dir': _receiptSaveDir,
       'currency_code': _currencyCode,
       'currency_symbol': _currencySymbol,
       'dial_code': _dialCode,
@@ -4441,6 +4455,7 @@ class _BillingScreenState extends State<BillingScreen> {
       'store_upi_id': _storeUpiId,
       'branch_number': _branchNumber,
       'wa_use_api': _waUseApi ? '1' : '0',
+      'wa_enabled': _waUseApi ? '1' : '0',
       'wa_phone_number_id': _waPhoneNumberId,
       'wa_access_token': _waAccessToken,
     });
@@ -4682,6 +4697,88 @@ class _BillingScreenState extends State<BillingScreen> {
                   const SizedBox(width: 4),
                   const Icon(Icons.chevron_right_rounded, color: Color(0xFFC7C7CC), size: 20),
                 ]),
+              ),
+            ),
+          ),
+        ]),
+        const SizedBox(height: 24),
+        _settingsSectionHeader('SAVED INVOICES'),
+        const SizedBox(height: 8),
+        _settingsCard([
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Row(children: [
+              Expanded(child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Save a PDF of every bill',
+                      style: GoogleFonts.inter(fontSize: 14, fontWeight: FontWeight.w600,
+                          color: _autoSaveReceipts ? AppColors.primary : AppColors.textMuted)),
+                  Text(
+                      _autoSaveReceipts
+                          ? 'Filed by year, month and date'
+                          : 'Bills are not saved to this Mac',
+                      style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
+                ],
+              )),
+              Switch(
+                value: _autoSaveReceipts,
+                onChanged: (v) => setState(() => _autoSaveReceipts = v),
+                activeTrackColor: AppColors.primary,
+                activeThumbColor: Colors.white,
+              ),
+            ]),
+          ),
+          _settingsDivider(),
+          Opacity(
+            opacity: _autoSaveReceipts ? 1 : 0.4,
+            child: IgnorePointer(
+              ignoring: !_autoSaveReceipts,
+              child: MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: GestureDetector(
+                  onTap: () async {
+                    final dir = await FilePicker.platform.getDirectoryPath(
+                        dialogTitle: 'Where should bills be saved?');
+                    if (dir != null && dir.isNotEmpty) {
+                      setState(() => _receiptSaveDir = dir);
+                    }
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                    child: Row(children: [
+                      const Icon(Icons.folder_outlined, size: 20, color: AppColors.textMuted),
+                      const SizedBox(width: 12),
+                      Expanded(child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Location', style: GoogleFonts.inter(fontSize: 14)),
+                          Text(
+                              _receiptSaveDir.trim().isEmpty
+                                  ? 'Documents (default)'
+                                  : _receiptSaveDir,
+                              maxLines: 1, overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.inter(
+                                  fontSize: 12, color: AppColors.textMuted)),
+                        ],
+                      )),
+                      if (_receiptSaveDir.trim().isNotEmpty)
+                        GestureDetector(
+                          onTap: () => setState(() => _receiptSaveDir = ''),
+                          child: Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: Text('Reset', style: GoogleFonts.inter(
+                                fontSize: 12, fontWeight: FontWeight.w600,
+                                color: AppColors.accentBlue)),
+                          ),
+                        ),
+                      Text('Change', style: GoogleFonts.inter(fontSize: 13,
+                          fontWeight: FontWeight.w600, color: AppColors.primary)),
+                      const SizedBox(width: 4),
+                      const Icon(Icons.chevron_right_rounded, color: Color(0xFFC7C7CC), size: 20),
+                    ]),
+                  ),
+                ),
               ),
             ),
           ),
@@ -5199,7 +5296,160 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   // Receipt preview panel (Flutter-rendered, updates instantly)
+
+  // ── Thermal preview rendered from the REAL print bytes ─────────────────────
+  // The old preview was a hand-built mock and had drifted from the approved
+  // receipt. This decodes what EscPosReceipt actually emits, so the preview
+  // cannot disagree with the paper. Read-only: nothing here changes printing.
+  Widget _buildThermalTruePreview() {
+    final cols = EscPosReceipt.colsForPaper(_editPaperSize);
+    final sample = TransactionRecord(
+      id: 'preview-000000',
+      customerName: 'Test Customer',
+      customerPhone: '',
+      items: [
+        TransactionItem(productId: 'a', productName: 'Sample Product A',
+            price: 250, quantity: 2, description: ''),
+        TransactionItem(productId: 'b', productName: 'Sample Product B',
+            price: 180, quantity: 1, description: ''),
+      ],
+      subtotal: 680,
+      discountAmount: 0,
+      taxAmount: _taxEnabled
+          ? 680 * ((double.tryParse(_editTaxRate) ?? 0) / 100)
+          : 0,
+      total: 680 +
+          (_taxEnabled ? 680 * ((double.tryParse(_editTaxRate) ?? 0) / 100) : 0),
+      paymentMethod: 'cash',
+      createdAt: DateTime.now(),
+      invoiceNumber: '178792',
+    );
+
+    List<int> bytes;
+    try {
+      bytes = EscPosReceipt(cols: cols, cut: false).build(
+        sample,
+        storeName: _editStoreName.isEmpty ? 'BillCat Store' : _editStoreName,
+        storeAddress: _editStoreAddress,
+        storePhone: _editStorePhone,
+        storeGstin: _editStoreGstin,
+        receiptFooter: _editReceiptFooter,
+        taxLabel: _editTaxLabel,
+        taxRate: _editTaxRate,
+        currencySymbol: _editCurrencySymbol,
+        storeTerms: _storeTerms,
+      );
+    } catch (_) {
+      return const Center(child: Text('Preview unavailable'));
+    }
+
+    final lines = _decodeEscPos(bytes);
+    return LayoutBuilder(builder: (context, c) {
+      // Monospace sized so exactly `cols` characters span the paper — that is
+      // what makes the column alignment match the printed receipt.
+      final paperW = (c.maxWidth - 96).clamp(240.0, 560.0);
+      final charW = paperW / cols;
+      final fontSize = charW / 0.6; // Courier advance is 0.6em
+      return SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(vertical: 28, horizontal: 24),
+        child: Center(
+          child: Container(
+            width: paperW + 32,
+            padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              boxShadow: [BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.18),
+                  blurRadius: 16, offset: const Offset(0, 6))],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final l in lines)
+                  Text(
+                    l.text,
+                    textAlign: l.align == 1
+                        ? TextAlign.center
+                        : l.align == 2 ? TextAlign.right : TextAlign.left,
+                    style: TextStyle(
+                      fontFamily: 'Courier',
+                      fontSize: l.big ? fontSize * 1.7 : fontSize,
+                      height: 1.35,
+                      fontWeight:
+                          l.bold || l.big ? FontWeight.w700 : FontWeight.w400,
+                      color: const Color(0xFF1D1D1F),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  /// Walks the ESC/POS stream and pulls out the printable lines with the
+  /// alignment, bold and double-size state that was active for each. Raster
+  /// images, QR blocks and the cut are skipped — they have no text.
+  List<_RcptLine> _decodeEscPos(List<int> b) {
+    final out = <_RcptLine>[];
+    final buf = StringBuffer();
+    var align = 0, size = 0;
+    var bold = false;
+
+    void flush() {
+      final t = buf.toString();
+      buf.clear();
+      out.add(_RcptLine(t, align, bold, size != 0));
+    }
+
+    var i = 0;
+    while (i < b.length) {
+      final c = b[i];
+      if (c == 0x1B) { // ESC
+        final n = i + 1 < b.length ? b[i + 1] : 0;
+        if (n == 0x61) { align = i + 2 < b.length ? b[i + 2] : 0; i += 3; continue; }
+        if (n == 0x45) { bold = (i + 2 < b.length ? b[i + 2] : 0) != 0; i += 3; continue; }
+        if (n == 0x40) { align = 0; bold = false; size = 0; i += 2; continue; }
+        if (n == 0x64 || n == 0x4A) { i += 3; continue; } // feed
+        i += 2; continue;
+      }
+      if (c == 0x1D) { // GS
+        final n = i + 1 < b.length ? b[i + 1] : 0;
+        if (n == 0x21) { size = i + 2 < b.length ? b[i + 2] : 0; i += 3; continue; }
+        if (n == 0x56) { i += 3; continue; } // cut
+        if (n == 0x76) { // raster: skip header + payload
+          if (i + 7 < b.length) {
+            final wb = b[i + 4] | (b[i + 5] << 8);
+            final h = b[i + 6] | (b[i + 7] << 8);
+            i += 8 + wb * h;
+          } else { i = b.length; }
+          continue;
+        }
+        if (n == 0x28) { // GS ( k — QR
+          if (i + 3 < b.length) {
+            final len = b[i + 3] | (b[i + 4] << 8);
+            i += 5 + len;
+          } else { i = b.length; }
+          continue;
+        }
+        i += 2; continue;
+      }
+      if (c == 0x0A) { flush(); i++; continue; }
+      if (c >= 0x20 && c <= 0x7E) { buf.write(String.fromCharCode(c)); }
+      i++;
+    }
+    if (buf.isNotEmpty) flush();
+    // Trim the trailing feed lines the printer needs but a screen doesn't.
+    while (out.isNotEmpty && out.last.text.trim().isEmpty) {
+      out.removeLast();
+    }
+    return out;
+  }
+
   Widget _buildReceiptPreview() {
+    // Thermal shows the genuine article, decoded from the print bytes.
+    if (_editPrinterTab == 'Thermal') return _buildThermalTruePreview();
     if (_editInvoiceLayout == 'GST') return _buildTaxInvoicePreview();
     if (_editInvoiceLayout == 'Classic') return _buildClassicInvoicePreview();
 
@@ -6096,7 +6346,6 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // ── WhatsApp Settings ──
   Widget _buildSettingsWhatsApp() {
-    final configured = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -6105,7 +6354,8 @@ class _BillingScreenState extends State<BillingScreen> {
         Padding(
           padding: const EdgeInsets.only(left: 2, bottom: 16),
           child: Text(
-            'Send invoices automatically via WhatsApp using Meta Cloud API. Free 1,000 conversations/month.',
+            'Send e-bills to customers on WhatsApp. Works out of the box — no '
+            'setup needed.',
             style: GoogleFonts.inter(fontSize: 12.5, color: const Color(0xFF6E6E73)),
           ),
         ),
@@ -6116,12 +6366,12 @@ class _BillingScreenState extends State<BillingScreen> {
               Expanded(child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Auto-send with Meta API',
+                  Text('Send e-bills via WhatsApp',
                       style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600,
                           color: _waUseApi ? AppColors.primary : AppColors.textDark)),
                   Text(
                       _waUseApi
-                          ? 'ON — BillCat sends the PDF itself. Needs a live token and a verified number.'
+                          ? 'ON — sent from BillCat\'s number, with your store name on every message.'
                           : 'OFF — opens WhatsApp with the bill ready to send. Works for any customer.',
                       style: GoogleFonts.inter(fontSize: 11, color: AppColors.textMuted)),
                 ],
@@ -6136,7 +6386,7 @@ class _BillingScreenState extends State<BillingScreen> {
           ),
         ]),
         const SizedBox(height: 16),
-        if (configured) ...[
+        if (_waUseApi) ...[
           Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
@@ -6147,39 +6397,15 @@ class _BillingScreenState extends State<BillingScreen> {
             child: Row(children: [
               const Icon(Icons.check_circle_rounded, size: 16, color: Color(0xFF1AAD56)),
               const SizedBox(width: 8),
-              Text('WhatsApp API configured', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: const Color(0xFF1AAD56))),
+              Expanded(
+                child: Text(
+                    'Ready — bills send from BillCat\'s number',
+                    style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: const Color(0xFF1AAD56))),
+              ),
             ]),
           ),
           const SizedBox(height: 16),
         ],
-        _settingsSectionHeader('META CLOUD API'),
-        const SizedBox(height: 12),
-        _settingsCard([
-          _settingsTextField('Phone Number ID', _editWaPhoneNumberId,
-              (v) => setState(() => _editWaPhoneNumberId = v),
-              hint: '1149269661601168'),
-          _settingsDivider(),
-          _settingsTextField('Access Token', _editWaAccessToken,
-              (v) => setState(() => _editWaAccessToken = v),
-              hint: 'EAAxxxxxxxx...', obscureText: true),
-        ]),
-        const SizedBox(height: 16),
-        Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: const Color(0xFFF0F4FF),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: AppColors.primary.withValues(alpha: 0.2)),
-          ),
-          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Icon(Icons.info_outline_rounded, size: 16, color: AppColors.primary),
-            const SizedBox(width: 10),
-            Expanded(child: Text(
-              'Get Phone Number ID and Access Token from Meta for Developers → BillCat app → WhatsApp → API Setup.',
-              style: GoogleFonts.inter(fontSize: 12, color: AppColors.primary),
-            )),
-          ]),
-        ),
       ],
     );
   }
@@ -7810,7 +8036,7 @@ class _BillingScreenState extends State<BillingScreen> {
     }
     bool sendWaAfterClose = false;
     final hasPhone = cart.customerPhone.isNotEmpty;
-    final hasWa = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
+    final hasWa = _waUseApi;
     final total = cart.total;
     final paidCtrl = TextEditingController(text: total.toStringAsFixed(2));
     final paidFocus = FocusNode();
@@ -7961,7 +8187,25 @@ class _BillingScreenState extends State<BillingScreen> {
     Future.microtask(() => paidFocus.requestFocus());
   }
 
+  static const _monthFolderNames = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+
+  /// Full month name for the receipts folder. Separate from the short
+  /// _monthName used in reports, which must keep its existing output.
+  String _monthFolderName(int m) => (m >= 1 && m <= 12)
+      ? _monthFolderNames[m - 1]
+      : m.toString().padLeft(2, '0');
+
+  /// Strips characters a file path cannot carry. A store name with a slash in
+  /// it would otherwise silently create a nested folder, or fail outright.
+  String _pathSafe(String s) => s
+      .replaceAll(RegExp(r'[/\\:*?"<>|\x00-\x1f]'), '-')
+      .trim();
+
   Future<void> _autoSavePdf(TransactionRecord tx) async {
+    if (!_autoSaveReceipts) return;
     try {
       final pdfBytes = await ReceiptPrinter.buildPdf(
         tx,
@@ -7975,13 +8219,27 @@ class _BillingScreenState extends State<BillingScreen> {
         storeUpiId: _storeUpiId,
       );
       final home = Platform.environment['HOME'] ?? '';
-      final safeName = _storeName.trim().isEmpty ? 'BillCat' : _storeName.trim();
-      final folder = Directory('$home/Documents/$safeName Receipts');
+      final base = _receiptSaveDir.trim().isEmpty
+          ? '$home/Documents'
+          : _receiptSaveDir.trim();
+      // Filed as: <Store> Receipts/YYYY/MM/DD/<invoice no>.pdf — zero-padded so
+      // Finder sorts them chronologically rather than 1, 10, 11, 2.
+      final safeStore = _pathSafe(_storeName);
+      final safeName = safeStore.isEmpty ? 'BillCat' : safeStore;
+      final d = tx.createdAt;
+      final y = d.year.toString();
+      final m = _monthFolderName(d.month);
+      // Folders can't contain '/', so the date reads day-month-year with dashes.
+      final day = '${d.day.toString().padLeft(2, '0')}-'
+          '${d.month.toString().padLeft(2, '0')}-$y';
+      final folder = Directory('$base/$safeName Receipts/$y/$m/$day');
       if (!folder.existsSync()) folder.createSync(recursive: true);
-      final receiptName = tx.invoiceNumber != null
-          ? 'Receipt-${tx.invoiceNumber}'
-          : 'Receipt-${billNo(tx)}';
-      await File('${folder.path}/$receiptName.pdf').writeAsBytes(pdfBytes);
+      final rawNo = (tx.invoiceNumber?.isNotEmpty ?? false)
+          ? tx.invoiceNumber!
+          : billNo(tx);
+      final invNo = _pathSafe(rawNo);
+      await File('${folder.path}/${invNo.isEmpty ? 'Receipt' : invNo}.pdf')
+          .writeAsBytes(pdfBytes);
     } catch (_) {}
   }
 
@@ -8137,8 +8395,10 @@ tbody td{font-size:13px;padding:10px 4px;vertical-align:top}
     // begin "91", so checking the prefix would skip valid numbers.
     final apiPhone = _toInternationalPhone(phone);
 
-    // If Meta API is configured, send directly
-    if (_waUseApi && _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty) {
+    // Always send through BillCat's relay. Any Meta ID/token a shop saved in
+    // an older version is ignored: those tokens expire, and a dead one would
+    // bypass the relay and fail every bill.
+    if (_waUseApi) {
       _showToast('Sending via WhatsApp...');
       try {
         final pdfBytes = await ReceiptPrinter.buildPdf(
@@ -8152,8 +8412,7 @@ tbody td{font-size:13px;padding:10px 4px;vertical-align:top}
           storeTerms: _storeTerms, logoPath: _logoPath,
           storeUpiId: _storeUpiId, docType: docType,
         );
-        final svc = _wa.WhatsAppService(
-            phoneNumberId: _waPhoneNumberId, accessToken: _waAccessToken);
+        final svc = _wa.WhatsAppService(phoneNumberId: '', accessToken: '');
         final ok = await svc.sendInvoicePdf(
           toPhone: apiPhone,
           pdfBytes: pdfBytes,
@@ -8165,6 +8424,7 @@ tbody td{font-size:13px;padding:10px 4px;vertical-align:top}
           docType: docType,
           invoiceLink: invoiceLink,
           paymentStatus: _waPaymentStatus(tx, docType),
+          dialCode: _dialCode,
         );
         if (ok) {
           if (mounted) _showToast('Invoice sent via WhatsApp!');
@@ -9687,12 +9947,6 @@ end tell
                       const SizedBox(width: 8),
                       Text('Update Stock', style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark)),
                     ])),
-                PopupMenuItem(value: 'barcode', height: 38,
-                    child: Row(children: [
-                      const Icon(Icons.barcode_reader, size: 14, color: AppColors.textMuted),
-                      const SizedBox(width: 8),
-                      Text('Print Barcode', style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark)),
-                    ])),
                 PopupMenuItem(value: 'delete', height: 38,
                     child: Row(children: [
                       const Icon(Icons.delete_outline_rounded, size: 14, color: AppColors.error),
@@ -9705,8 +9959,6 @@ end tell
                   _showEditProductDialog(p);
                 } else if (v == 'stock') {
                   _showUpdateStockDialog(p);
-                } else if (v == 'barcode') {
-                  _showPrintBarcodeDialog(p);
                 } else if (v == 'delete') {
                   _confirmDeleteProduct(p);
                 }
@@ -12938,8 +13190,148 @@ end tell
               style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted)),
           const SizedBox(height: 24),
           if (_utilitiesView == 'Quotation') _buildQuotationView(),
+          if (_utilitiesView == 'GST') _buildGstView(),
         ],
       ),
+    );
+  }
+
+  // ── GST invoice list ─────────────────────────────────────────────────────────
+  // Read-only. Lists the bills already loaded for this month that carried tax;
+  // bills with no GST are left out. Nothing here recomputes tax — every figure
+  // shown is a value stored on the sale.
+  Widget _buildGstView() {
+    final rows = _txListMonth.where((t) => t.taxAmount > 0).toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+    String fmtAmt(double v) {
+      final parts = v.toStringAsFixed(2).split('.');
+      final intPart = parts[0];
+      final buf = StringBuffer();
+      for (int i = 0; i < intPart.length; i++) {
+        if (i > 0 && (intPart.length - i) % 3 == 0) buf.write(',');
+        buf.write(intPart[i]);
+      }
+      return '$_currencySymbol$buf.${parts[1]}';
+    }
+
+    String fmtDate(DateTime dt) =>
+        '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')}/${dt.year}';
+
+    final totalTax = rows.fold<double>(0, (s, t) => s + t.taxAmount);
+    final totalSub = rows.fold<double>(0, (s, t) => s + t.subtotal);
+    final totalVal = rows.fold<double>(0, (s, t) => s + t.total);
+
+    Widget cell(String s, int flex, {TextAlign align = TextAlign.left, bool head = false}) =>
+        Expanded(
+          flex: flex,
+          child: Text(s,
+              textAlign: align,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: GoogleFonts.inter(
+                fontSize: head ? 11 : 13,
+                fontWeight: head ? FontWeight.w700 : FontWeight.w500,
+                letterSpacing: head ? 0.5 : 0,
+                color: head ? AppColors.textMuted : AppColors.textDark,
+              )),
+        );
+
+    return Column(
+      children: [
+        Row(children: [
+          _reportSummaryCard('$_taxLabel Collected', fmtAmt(totalTax),
+              Icons.account_balance_outlined, AppColors.accent, currencyIcon: _currencySymbol),
+          const SizedBox(width: 16),
+          _reportSummaryCard('Taxable Value', fmtAmt(totalSub),
+              Icons.receipt_long_rounded, AppColors.accentBlue, currencyIcon: _currencySymbol),
+          const SizedBox(width: 16),
+          _reportSummaryCard('Invoice Value', fmtAmt(totalVal),
+              Icons.summarize_outlined, const Color(0xFFF59E0B), currencyIcon: _currencySymbol),
+          const SizedBox(width: 16),
+          _reportSummaryCard('Invoices', '${rows.length}',
+              Icons.description_outlined, const Color(0xFF8B5CF6)),
+        ]),
+        const SizedBox(height: 24),
+        Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('$_taxLabel Invoices', style: GoogleFonts.manrope(
+                    fontSize: 15, fontWeight: FontWeight.w700, color: AppColors.textDark)),
+                Text('Bills this month that carried $_taxLabel',
+                    style: GoogleFonts.inter(
+                        fontSize: 12, fontWeight: FontWeight.w300, color: AppColors.textMuted)),
+              ]),
+            ),
+            if (rows.isNotEmpty)
+              Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text(fmtAmt(totalTax), style: GoogleFonts.manrope(
+                    fontSize: 16, fontWeight: FontWeight.w700, color: AppColors.textDark)),
+                Text('${rows.length} ${rows.length == 1 ? 'invoice' : 'invoices'}',
+                    style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
+              ]),
+          ]),
+          const SizedBox(height: 18),
+          if (rows.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 48),
+              child: Center(
+                child: Column(children: [
+                  Icon(Icons.receipt_long_outlined, size: 34, color: AppColors.textMuted.withValues(alpha: 0.5)),
+                  const SizedBox(height: 10),
+                  Text('No $_taxLabel invoices this month',
+                      style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted)),
+                ]),
+              ),
+            )
+          else ...[
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              decoration: const BoxDecoration(
+                border: Border(bottom: BorderSide(color: AppColors.border)),
+              ),
+              child: Row(children: [
+                cell('INVOICE', 18, head: true),
+                cell('DATE', 18, head: true),
+                cell('CUSTOMER', 30, head: true),
+                cell('SUBTOTAL', 17, align: TextAlign.right, head: true),
+                cell(_taxLabel.toUpperCase(), 17, align: TextAlign.right, head: true),
+                cell('TOTAL', 20, align: TextAlign.right, head: true),
+              ]),
+            ),
+            for (final t in rows)
+              InkWell(
+                onTap: () => _showTransactionDetail(t),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  decoration: const BoxDecoration(
+                    border: Border(bottom: BorderSide(color: AppColors.border)),
+                  ),
+                  child: Row(children: [
+                    cell('#${billNo(t)}', 18),
+                    cell(fmtDate(t.createdAt), 18),
+                    cell((t.customerName?.isNotEmpty == true) ? t.customerName! : '—', 30),
+                    cell(fmtAmt(t.subtotal), 17, align: TextAlign.right),
+                    cell(fmtAmt(t.taxAmount), 17, align: TextAlign.right),
+                    cell(fmtAmt(t.total), 20, align: TextAlign.right),
+                  ]),
+                ),
+              ),
+          ],
+        ],
+      ),
+        ),
+      ],
     );
   }
 
@@ -16790,4 +17182,14 @@ class _VariantDraft {
         sku: v.sku,
         barcodeNo: v.barcodeNo,
       );
+}
+
+/// One printable line lifted out of an ESC/POS stream, with the styling that
+/// was in force when it was emitted.
+class _RcptLine {
+  final String text;
+  final int align; // 0 left, 1 center, 2 right
+  final bool bold;
+  final bool big;
+  const _RcptLine(this.text, this.align, this.bold, this.big);
 }

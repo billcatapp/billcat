@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 class WhatsAppService {
   final String phoneNumberId;
@@ -17,6 +18,28 @@ class WhatsAppService {
   static const Duration _connectTimeout = Duration(seconds: 10);
   static const Duration _uploadTimeout = Duration(seconds: 45);
   static const Duration _sendTimeout = Duration(seconds: 30);
+
+  /// Approved Utility template in WhatsApp Manager. A template can be sent
+  /// outside the 24-hour customer-service window; a free-form document message
+  /// cannot, so a walk-in customer who never messaged the shop only ever
+  /// receives a template.
+  static const _templateName = 'invoice_receipts';
+  static const _templateLanguage = 'en';
+
+  /// BillCat's own relay, used by shops that have not brought their own Meta
+  /// number. The WhatsApp token stays on the server: anything shipped in the
+  /// app binary can be extracted and used to send from BillCat's number.
+  static const _relayUrl =
+      'https://xawpxbhglzhaibmcpwho.supabase.co/functions/v1/whatsapp-send';
+
+  bool get isConfigured => phoneNumberId.isNotEmpty && accessToken.isNotEmpty;
+
+  /// Meta rejects template parameters that are empty or carry newlines, tabs
+  /// or runs of 4+ spaces, so every value is flattened before it is sent.
+  static String _param(String value, {required String fallback}) {
+    final cleaned = value.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return cleaned.isEmpty ? fallback : cleaned;
+  }
 
   WhatsAppService({required this.phoneNumberId, required this.accessToken});
 
@@ -102,6 +125,149 @@ class WhatsAppService {
     }
   }
 
+  /// Posts [body] with the operating system's own curl (macOS /usr/bin/curl,
+  /// Windows 10/11 System32\curl.exe) instead of Dart's HttpClient. Some
+  /// mobile/hotspot connections corrupt Dart's TLS uploads above ~16 KB
+  /// (BAD_RECORD_MAC, connection reset, broken pipe) while the OS's own TLS
+  /// gets through, and a bill PDF is ~450 KB.
+  ///
+  /// Returns null when curl can't be used, or failed before anything reached
+  /// the server — the caller then falls back to HttpClient. Any later failure
+  /// is returned as an error and never retried, so a bill that did go out is
+  /// not sent twice.
+  static Future<({int status, String body, String? error})?>
+      _postWithSystemCurl(String url, String bearer, List<int> body) async {
+    final String curl;
+    if (Platform.isMacOS) {
+      curl = '/usr/bin/curl';
+    } else if (Platform.isWindows) {
+      final root = Platform.environment['SystemRoot'] ?? r'C:\Windows';
+      curl = '$root\\System32\\curl.exe';
+    } else {
+      return null;
+    }
+    if (!File(curl).existsSync()) return null;
+    Directory? dir;
+    try {
+      dir = await Directory.systemTemp.createTemp('billcat_wa_');
+      final bodyFile = File('${dir.path}${Platform.pathSeparator}bill.json');
+      await bodyFile.writeAsBytes(body, flush: true);
+      final proc = await Process.start(curl, [
+        '--silent',
+        '--show-error',
+        '--connect-timeout', '10',
+        '--max-time', '60',
+        // The session token goes in on stdin, never on the command line
+        // where any other process on the machine could read it.
+        '--config', '-',
+        '--header', 'Content-Type: application/json',
+        '--data-binary', '@${bodyFile.path}',
+        '--write-out', '\n%{http_code}',
+        url,
+      ]);
+      final out = proc.stdout.transform(utf8.decoder).join();
+      final err = proc.stderr.transform(utf8.decoder).join();
+      proc.stdin.write('header = "Authorization: Bearer $bearer"\n');
+      await proc.stdin.close();
+      final code = await proc.exitCode.timeout(const Duration(seconds: 75),
+          onTimeout: () {
+        proc.kill();
+        return -1;
+      });
+      final text = await out;
+      if (code == -1 || code == 28) {
+        return (
+          status: 0,
+          body: '',
+          error: 'WhatsApp timed out — check the internet connection',
+        );
+      }
+      if (code != 0) {
+        // Failed before the request reached the server: bad init/URL,
+        // DNS, connect, TLS handshake or certificate. Safe to retry.
+        const notSent = {1, 2, 3, 5, 6, 7, 35, 60, 77};
+        if (notSent.contains(code)) return null;
+        return (
+          status: 0,
+          body: '',
+          error: 'WhatsApp relay — network error (curl $code: '
+              '${(await err).trim()})',
+        );
+      }
+      final nl = text.lastIndexOf('\n');
+      return (
+        status: int.tryParse(text.substring(nl + 1).trim()) ?? 0,
+        body: nl < 0 ? '' : text.substring(0, nl),
+        error: null,
+      );
+    } on ProcessException {
+      return null;
+    } on FileSystemException {
+      return null;
+    } finally {
+      try {
+        await dir?.delete(recursive: true);
+      } catch (_) {}
+    }
+  }
+
+  /// Sends through BillCat's relay. The shop's Supabase session identifies it
+  /// to the server, which applies the daily cap and holds the WhatsApp token.
+  Future<bool> _sendViaRelay(Map<String, dynamic> payload) async {
+    final session = Supabase.instance.client.auth.currentSession;
+    if (session == null) {
+      lastError = 'Sign in to send bills on WhatsApp.';
+      return false;
+    }
+    // First choice: the OS's own curl (see _postWithSystemCurl). HttpClient
+    // below is only the fallback for when curl can't be used.
+    final viaCurl = await _postWithSystemCurl(
+        _relayUrl, session.accessToken, utf8.encode(jsonEncode(payload)));
+    if (viaCurl != null) {
+      if (viaCurl.error != null) {
+        lastError = viaCurl.error;
+        return false;
+      }
+      if (viaCurl.status == 200) return true;
+      try {
+        lastError = (jsonDecode(viaCurl.body) as Map<String, dynamic>)['error']
+            ?.toString();
+      } catch (_) {
+        lastError = 'HTTP ${viaCurl.status}';
+      }
+      return false;
+    }
+    final client = HttpClient()..connectionTimeout = _connectTimeout;
+    try {
+      final req = await client.postUrl(Uri.parse(_relayUrl));
+      req.headers.set('Authorization', 'Bearer ${session.accessToken}');
+      req.headers.contentType =
+          ContentType('application', 'json', charset: 'utf-8');
+      final bytes = utf8.encode(jsonEncode(payload));
+      req.headers.contentLength = bytes.length;
+      req.add(bytes);
+      final res = await req.close().timeout(_uploadTimeout);
+      final body =
+          await res.transform(utf8.decoder).join().timeout(_uploadTimeout);
+      if (res.statusCode == 200) return true;
+      try {
+        lastError =
+            (jsonDecode(body) as Map<String, dynamic>)['error']?.toString();
+      } catch (_) {
+        lastError = 'HTTP ${res.statusCode}';
+      }
+      return false;
+    } on TimeoutException {
+      lastError = 'WhatsApp timed out — check the internet connection';
+      return false;
+    } catch (e) {
+      lastError = 'WhatsApp relay — $e';
+      return false;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   // Send a PDF document message to a phone number
   Future<bool> sendInvoicePdf({
     required String toPhone,
@@ -117,35 +283,67 @@ class WhatsAppService {
     /// is what a Quotation needs. Defaults to the previous hardcoded value so
     /// no existing caller changes behaviour.
     String paymentStatus = 'Paid',
+    String dialCode = '91',
   }) async {
+    lastError = null;
     final phone = _normalize(toPhone);
     if (phone.isEmpty) return false;
+
+    if (!isConfigured) {
+      return _sendViaRelay({
+        'toPhone': toPhone,
+        'dialCode': dialCode,
+        'pdfBase64': base64Encode(pdfBytes),
+        'invoiceNo': invoiceNo,
+        'storeName': storeName,
+        'customerName': customerName,
+        'amount': amount,
+        'date': date,
+        'docType': docType,
+      });
+    }
 
     final mediaId = await uploadPdf(pdfBytes, '$docType-$invoiceNo.pdf');
     if (mediaId == null) return false;
 
-    final name = customerName.isNotEmpty ? customerName : 'Valued Customer';
-    final caption =
-        'Hello $name,\n\n'
-        'Thank you for choosing $storeName.\n'
-        'Your e-bill for $docType #$invoiceNo has been generated successfully.\n\n'
-        'Amount: $amount\n'
-        'Date: $date\n'
-        '${paymentStatus.isEmpty ? '' : 'Payment Status: $paymentStatus\n'}\n'
-        'Please find your bill attached.\n\n'
-        'For any queries, feel free to contact us.\n'
-        'Thank you for your support!\n\n'
-        '— $storeName'
-        '${invoiceLink.isNotEmpty ? '\n\nView your bill: $invoiceLink' : ''}';
-
+    // The approved template carries neither [invoiceLink] nor [paymentStatus];
+    // the PDF is the header and the six body values follow {{1}}..{{6}} in
+    // the approved text exactly. Both parameters stay so callers are unchanged.
     final payload = jsonEncode({
       'messaging_product': 'whatsapp',
       'to': phone,
-      'type': 'document',
-      'document': {
-        'id': mediaId,
-        'filename': '$docType-$invoiceNo.pdf',
-        'caption': caption,
+      'type': 'template',
+      'template': {
+        'name': _templateName,
+        'language': {'code': _templateLanguage},
+        'components': [
+          {
+            'type': 'header',
+            'parameters': [
+              {
+                'type': 'document',
+                'document': {
+                  'id': mediaId,
+                  'filename': '$docType-$invoiceNo.pdf',
+                },
+              },
+            ],
+          },
+          {
+            'type': 'body',
+            'parameters': [
+              {
+                'type': 'text',
+                'text': _param(customerName, fallback: 'Valued Customer'),
+              },
+              {'type': 'text', 'text': _param(storeName, fallback: 'BillCat')},
+              {'type': 'text', 'text': _param(docType, fallback: 'Invoice')},
+              {'type': 'text', 'text': _param(invoiceNo, fallback: '-')},
+              {'type': 'text', 'text': _param(amount, fallback: '-')},
+              {'type': 'text', 'text': _param(date, fallback: '-')},
+            ],
+          },
+        ],
       },
     });
 
