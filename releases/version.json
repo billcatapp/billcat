@@ -1,8 +1,8 @@
 {
-  "version": "1.1.8",
-  "build": 53,
-  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.8/BillCat-1.1.8.zip",
-  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.8/BillCat-1.1.8.dmg",
-  "release_notes": "Hybrid cash + UPI payments with the split printed on the receipt, a Cash vs Bank box in the sales report, and a custom period picker for any day, month, year or date range.",
+  "version": "1.1.12",
+  "build": 57,
+  "download_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.12/BillCat-1.1.12.zip",
+  "dmg_url": "https://github.com/billcatapp/billcat/releases/download/v1.1.12/BillCat-1.1.12.dmg",
+  "release_notes": "WhatsApp e-bills now send from BillCat's own number, so no Meta setup is needed, and large bill PDFs no longer fail on mobile connections. Bills can be auto-saved as PDFs filed by date, there is a new GST page listing bills that carried tax, and the thermal receipt preview now shows exactly what the printer prints.",
   "mandatory": false
 }
